@@ -1,8 +1,67 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback } from "react";
+import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ReferenceLine } from "recharts";
+import { Play, Loader2, TrendingUp, TrendingDown, AlertTriangle, Activity, Target, Zap, ChevronRight, Info } from "lucide-react";
 
-// ---------- Constants ----------
+// ---------- Deriv WebSocket helpers ----------
+const APP_ID = 1089; // public demo app_id, works for read-only market data
 
-const VOLATILITY_SYMBOLS = [
+function connectDeriv() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`);
+    ws.onopen = () => resolve(ws);
+    ws.onerror = (e) => reject(e);
+  });
+}
+
+function requestTicksHistory(ws, symbol, count = 5000) {
+  return new Promise((resolve, reject) => {
+    const reqId = Math.floor(Math.random() * 1e9);
+    const handler = (msg) => {
+      const data = JSON.parse(msg.data);
+      if (data.req_id !== reqId) return;
+      ws.removeEventListener("message", handler);
+      if (data.error) reject(new Error(data.error.message));
+      else resolve(data);
+    };
+    ws.addEventListener("message", handler);
+    ws.send(JSON.stringify({
+      ticks_history: symbol,
+      adjust_start_time: 1,
+      count,
+      end: "latest",
+      start: 1,
+      style: "ticks",
+      req_id: reqId,
+    }));
+  });
+}
+
+function requestCandles(ws, symbol, granularity, count = 3000) {
+  return new Promise((resolve, reject) => {
+    const reqId = Math.floor(Math.random() * 1e9);
+    const handler = (msg) => {
+      const data = JSON.parse(msg.data);
+      if (data.req_id !== reqId) return;
+      ws.removeEventListener("message", handler);
+      if (data.error) reject(new Error(data.error.message));
+      else resolve(data);
+    };
+    ws.addEventListener("message", handler);
+    ws.send(JSON.stringify({
+      ticks_history: symbol,
+      adjust_start_time: 1,
+      count,
+      end: "latest",
+      start: 1,
+      style: "candles",
+      granularity,
+      req_id: reqId,
+    }));
+  });
+}
+
+// ---------- Symbols ----------
+const SYMBOLS = [
   { code: "R_10", label: "Volatility 10 Index" },
   { code: "R_25", label: "Volatility 25 Index" },
   { code: "R_50", label: "Volatility 50 Index" },
@@ -13,1137 +72,439 @@ const VOLATILITY_SYMBOLS = [
   { code: "1HZ50V", label: "Volatility 50 (1s) Index" },
   { code: "1HZ75V", label: "Volatility 75 (1s) Index" },
   { code: "1HZ100V", label: "Volatility 100 (1s) Index" },
+  { code: "BOOM1000", label: "Boom 1000 Index" },
+  { code: "CRASH1000", label: "Crash 1000 Index" },
 ];
 
-const TICK_HISTORY = 120; // ticks kept for analysis
-const STREAK_LOOKBACK = 20;
-const FREQ_LOOKBACK = 50;
-const MATCH_LOOKBACK = 30;
-
-// Deriv-App-ID must come from a PAT-type app registered on developers.deriv.com
-// (Dashboard → Registered apps → Create new app → Native apps → PAT).
-// The old legacy app_id=1089 does not work with the new OTP/Bearer auth flow.
-
-const MODES = {
-  DIGITS: "digits",
-  RISE_FALL: "rise_fall",
-  ACCUMULATORS: "accumulators",
-};
-
-// Rise/Fall and Accumulators use price quotes directly (not last-digit),
-// so they can run on any market, including Volatility Indices.
-const MA_FAST = 8;
-const MA_SLOW = 21;
-const RSI_PERIOD = 14;
-const RANGE_LOOKBACK = 30; // for accumulators volatility/range analysis
-const SURVIVAL_LOOKBACK = 60; // ticks examined for barrier-survival stats
-
-// ---------- Digit analysis engine ----------
-// Three independent sub-signals over the last-digit stream, combined into one
-// composite recommendation. Each sub-signal outputs a digit 0-9 (its pick)
-// and a confidence 0-1. The composite averages weighted confidences per digit.
-
-function analyzeStreaks(digits) {
-  const recent = digits.slice(-STREAK_LOOKBACK);
-  if (recent.length < 5) return null;
-
-  // Even/odd streak detection
-  const parity = recent.map((d) => d % 2); // 0 = even, 1 = odd
-  let streak = 1;
-  for (let i = parity.length - 1; i > 0; i--) {
-    if (parity[i] === parity[i - 1]) streak++;
-    else break;
+// ---------- Indicators ----------
+function ema(values, period) {
+  const k = 2 / (period + 1);
+  const out = new Array(values.length).fill(null);
+  let prev = null;
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] == null) continue;
+    if (prev == null) { prev = values[i]; out[i] = prev; continue; }
+    prev = values[i] * k + prev * (1 - k);
+    out[i] = prev;
   }
-  const lastParity = parity[parity.length - 1];
-  // Longer streak -> higher confidence the OPPOSITE parity is due
-  const confidence = Math.min(0.9, 0.15 * streak);
-  const predictedParity = lastParity === 0 ? 1 : 0; // predict break of streak
-
-  // Over/under 5 streak detection
-  const overUnder = recent.map((d) => (d > 4 ? 1 : 0)); // 1 = over(5-9), 0 = under(0-4)
-  let ouStreak = 1;
-  for (let i = overUnder.length - 1; i > 0; i--) {
-    if (overUnder[i] === overUnder[i - 1]) ouStreak++;
-    else break;
-  }
-  const lastOU = overUnder[overUnder.length - 1];
-  const ouConfidence = Math.min(0.9, 0.15 * ouStreak);
-  const predictedOU = lastOU === 0 ? 1 : 0;
-
-  return {
-    parityStreak: streak,
-    predictedParity, // 0 even, 1 odd
-    parityConfidence: confidence,
-    ouStreak,
-    predictedOU, // 0 under(0-4), 1 over(5-9)
-    ouConfidence,
-  };
+  return out;
 }
 
-function analyzeFrequency(digits) {
-  const recent = digits.slice(-FREQ_LOOKBACK);
-  if (recent.length < 10) return null;
-  const counts = new Array(10).fill(0);
-  recent.forEach((d) => counts[d]++);
-  const expected = recent.length / 10;
-  // Digits under-represented recently -> "due" -> higher score
-  const deviations = counts.map((c) => expected - c);
-  const maxDeviation = Math.max(...deviations.map(Math.abs), 1);
-  const scores = deviations.map((d) => Math.max(0, d) / maxDeviation);
-  return { counts, scores, expected };
-}
-
-function analyzeMatchesDiffers(digits) {
-  const recent = digits.slice(-MATCH_LOOKBACK);
-  if (recent.length < 5) return null;
-  const last = recent[recent.length - 1];
-  let matches = 0;
-  for (let i = 0; i < recent.length - 1; i++) {
-    if (recent[i] === last) matches++;
+function rsi(values, period = 14) {
+  const out = new Array(values.length).fill(null);
+  let gains = 0, losses = 0;
+  for (let i = 1; i < values.length; i++) {
+    const change = values[i] - values[i - 1];
+    const gain = Math.max(change, 0);
+    const loss = Math.max(-change, 0);
+    if (i <= period) {
+      gains += gain; losses += loss;
+      if (i === period) {
+        const avgG = gains / period, avgL = losses / period;
+        const rs = avgL === 0 ? 100 : avgG / avgL;
+        out[i] = 100 - 100 / (1 + rs);
+      }
+    } else {
+      gains = (gains * (period - 1) + gain) / period;
+      losses = (losses * (period - 1) + loss) / period;
+      const rs = losses === 0 ? 100 : gains / losses;
+      out[i] = 100 - 100 / (1 + rs);
+    }
   }
-  const matchRate = matches / (recent.length - 1);
-  // Baseline expected match rate for a fair digit is 1/10 = 0.1
-  const deviation = matchRate - 0.1;
-  return { last, matchRate, deviation };
+  return out;
 }
 
-function composite(digits) {
-  const streaks = analyzeStreaks(digits);
-  const freq = analyzeFrequency(digits);
-  const matches = analyzeMatchesDiffers(digits);
+function lastDigit(price, pipSize = 2) {
+  const str = price.toFixed(pipSize);
+  return parseInt(str[str.length - 1], 10);
+}
 
-  if (!streaks || !freq || !matches) return null;
+// ---------- Strategy: Rise/Fall EMA+RSI trend ----------
+function backtestRiseFall(candles, params) {
+  const { emaFast, emaSlow, rsiPeriod, rsiUpper, rsiLower, stake, payout, duration } = params;
+  const closes = candles.map((c) => c.close);
+  const fastArr = ema(closes, emaFast);
+  const slowArr = ema(closes, emaSlow);
+  const rsiArr = rsi(closes, rsiPeriod);
 
-  // Build per-digit composite score (0-9) blending frequency "due" score
-  // with streak-implied parity/over-under leaning.
-  const digitScores = new Array(10).fill(0).map((_, d) => {
-    let score = freq.scores[d] * 0.5; // weight: frequency 50%
+  const trades = [];
+  let equity = 0;
+  const equityCurve = [{ i: 0, equity: 0 }];
 
-    const parity = d % 2;
-    if (parity === streaks.predictedParity) score += streaks.parityConfidence * 0.25;
+  for (let i = Math.max(emaSlow, rsiPeriod) + 1; i < closes.length - duration; i++) {
+    const fPrev = fastArr[i - 1], sPrev = slowArr[i - 1];
+    const fNow = fastArr[i], sNow = slowArr[i];
+    const rsiNow = rsiArr[i];
+    if ([fPrev, sPrev, fNow, sNow, rsiNow].some((v) => v == null)) continue;
 
-    const ou = d > 4 ? 1 : 0;
-    if (ou === streaks.predictedOU) score += streaks.ouConfidence * 0.25;
+    let direction = null;
+    if (fPrev <= sPrev && fNow > sNow && rsiNow < rsiUpper) direction = "RISE";
+    else if (fPrev >= sPrev && fNow < sNow && rsiNow > rsiLower) direction = "FALL";
+    if (!direction) continue;
 
-    return score;
+    const entryPrice = closes[i];
+    const exitPrice = closes[i + duration];
+    const won = direction === "RISE" ? exitPrice > entryPrice : exitPrice < entryPrice;
+    const pnl = won ? stake * (payout - 1) : -stake;
+    equity += pnl;
+    trades.push({ i, direction, entryPrice, exitPrice, won, pnl });
+    equityCurve.push({ i: trades.length, equity: Number(equity.toFixed(2)) });
+  }
+  return summarize(trades, equityCurve, stake);
+}
+
+// ---------- Strategy: Over/Under digit-frequency deviation ----------
+function backtestOverUnder(ticks, params) {
+  const { lookback, deviationThreshold, barrier, mode, stake, payout, pipSize } = params;
+  const digits = ticks.map((t) => lastDigit(t.quote ?? t.price, pipSize));
+  const trades = [];
+  let equity = 0;
+  const equityCurve = [{ i: 0, equity: 0 }];
+  const expected = 1 / 10;
+
+  for (let i = lookback; i < digits.length - 1; i++) {
+    const window = digits.slice(i - lookback, i);
+    const freq = new Array(10).fill(0);
+    window.forEach((d) => freq[d]++);
+    const rates = freq.map((c) => c / lookback);
+
+    // Over X: bet digit > barrier stays under-represented -> trade OVER if digits <=barrier are over-represented (mean reversion)
+    const underCount = rates.slice(0, barrier + 1).reduce((a, b) => a + b, 0);
+    const overCount = rates.slice(barrier + 1).reduce((a, b) => a + b, 0);
+    const expectedUnder = (barrier + 1) / 10;
+    const deviation = underCount - expectedUnder;
+
+    let direction = null;
+    if (mode === "meanReversion") {
+      if (deviation > deviationThreshold) direction = "OVER"; // under-digits overrepresented -> bet reverts to over
+      else if (-deviation > deviationThreshold) direction = "UNDER";
+    } else {
+      // momentum: bet with the recent bias continuing
+      if (deviation > deviationThreshold) direction = "UNDER";
+      else if (-deviation > deviationThreshold) direction = "OVER";
+    }
+    if (!direction) continue;
+
+    const nextDigit = digits[i];
+    const won = direction === "OVER" ? nextDigit > barrier : nextDigit <= barrier;
+    const pnl = won ? stake * (payout - 1) : -stake;
+    equity += pnl;
+    trades.push({ i, direction, nextDigit, won, pnl });
+    equityCurve.push({ i: trades.length, equity: Number(equity.toFixed(2)) });
+  }
+  return summarize(trades, equityCurve, stake);
+}
+
+function summarize(trades, equityCurve, stake) {
+  const wins = trades.filter((t) => t.won).length;
+  const losses = trades.length - wins;
+  const winRate = trades.length ? (wins / trades.length) * 100 : 0;
+  const totalPnl = trades.reduce((a, t) => a + t.pnl, 0);
+  const avgPnl = trades.length ? totalPnl / trades.length : 0;
+  let peak = 0, maxDD = 0;
+  equityCurve.forEach((p) => {
+    peak = Math.max(peak, p.equity);
+    maxDD = Math.min(maxDD, p.equity - peak);
   });
-
-  const topDigit = digitScores.indexOf(Math.max(...digitScores));
-  const topScore = digitScores[topDigit];
-
-  // Matches/Differs recommendation: if last digit shows high repeat rate,
-  // lean "Matches"; otherwise lean "Differs" (fair-digit default).
-  const matchesLean = matches.deviation > 0.03 ? "MATCHES" : "DIFFERS";
-  const matchesConfidence = Math.min(0.9, 0.5 + Math.abs(matches.deviation) * 3);
-
-  const evenOddLean = streaks.predictedParity === 0 ? "EVEN" : "ODD";
-  const overUnderLean = streaks.predictedOU === 1 ? "OVER 5" : "UNDER 5";
-
-  const overallConfidence = (topScore + streaks.parityConfidence + streaks.ouConfidence + matchesConfidence) / 4;
-
-  return {
-    topDigit,
-    topScore,
-    digitScores,
-    evenOddLean,
-    parityConfidence: streaks.parityConfidence,
-    overUnderLean,
-    ouConfidence: streaks.ouConfidence,
-    matchesLean,
-    matchesConfidence,
-    matchRate: matches.matchRate,
-    parityStreak: streaks.parityStreak,
-    ouStreak: streaks.ouStreak,
-    overallConfidence: Math.min(0.95, overallConfidence),
-    freqCounts: freq.counts,
-  };
+  const grossWin = trades.filter(t => t.won).reduce((a, t) => a + t.pnl, 0);
+  const grossLoss = Math.abs(trades.filter(t => !t.won).reduce((a, t) => a + t.pnl, 0));
+  const profitFactor = grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? Infinity : 0);
+  return { trades, equityCurve, wins, losses, winRate, totalPnl, avgPnl, maxDD, profitFactor, stakeTotal: trades.length * stake };
 }
 
-// ---------- Rise/Fall analysis engine ----------
-// Composite of moving average crossover (trend) + RSI (momentum),
-// operating on the raw price stream rather than last digits.
+// ---------- UI ----------
+const INK = "#12131a";
+const PAPER = "#f6f4ee";
+const ACCENT = "#2f6f5e"; // deep ledger green
+const ACCENT2 = "#b5482f"; // rust for losses/warnings
+const LINE = "#d9d4c6";
 
-function sma(values, period) {
-  if (values.length < period) return null;
-  const slice = values.slice(-period);
-  return slice.reduce((a, b) => a + b, 0) / period;
-}
-
-function calcRSI(values, period) {
-  if (values.length < period + 1) return null;
-  const slice = values.slice(-(period + 1));
-  let gains = 0;
-  let losses = 0;
-  for (let i = 1; i < slice.length; i++) {
-    const diff = slice[i] - slice[i - 1];
-    if (diff > 0) gains += diff;
-    else losses += Math.abs(diff);
-  }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
-}
-
-function analyzeRiseFall(prices) {
-  if (prices.length < MA_SLOW + 1) return null;
-
-  const fastMA = sma(prices, MA_FAST);
-  const slowMA = sma(prices, MA_SLOW);
-  const prevFastMA = sma(prices.slice(0, -1), MA_FAST);
-  const prevSlowMA = sma(prices.slice(0, -1), MA_SLOW);
-
-  if (fastMA === null || slowMA === null || prevFastMA === null || prevSlowMA === null) return null;
-
-  // Crossover detection
-  const wasBelowOrEqual = prevFastMA <= prevSlowMA;
-  const isAbove = fastMA > slowMA;
-  const justCrossedUp = wasBelowOrEqual && isAbove;
-  const justCrossedDown = !wasBelowOrEqual && !isAbove;
-  const maSeparation = Math.abs(fastMA - slowMA) / slowMA;
-
-  const maLean = isAbove ? "RISE" : "FALL";
-  // Confidence: stronger when separation is wider, boosted right after a fresh cross
-  let maConfidence = Math.min(0.85, maSeparation * 400);
-  if (justCrossedUp || justCrossedDown) maConfidence = Math.min(0.9, maConfidence + 0.15);
-
-  const rsi = calcRSI(prices, RSI_PERIOD);
-  if (rsi === null) return null;
-
-  let rsiLean, rsiConfidence;
-  if (rsi >= 70) {
-    rsiLean = "FALL"; // overbought, expect pullback
-    rsiConfidence = Math.min(0.85, (rsi - 70) / 30 + 0.4);
-  } else if (rsi <= 30) {
-    rsiLean = "RISE"; // oversold, expect bounce
-    rsiConfidence = Math.min(0.85, (30 - rsi) / 30 + 0.4);
-  } else {
-    // Neutral zone: lean with momentum direction, low confidence
-    rsiLean = rsi >= 50 ? "RISE" : "FALL";
-    rsiConfidence = Math.abs(rsi - 50) / 50 * 0.3;
-  }
-
-  // Composite: weight MA 55%, RSI 45%
-  const agree = maLean === rsiLean;
-  const compositeLean = agree ? maLean : (maConfidence >= rsiConfidence ? maLean : rsiLean);
-  const overallConfidence = agree
-    ? Math.min(0.95, maConfidence * 0.55 + rsiConfidence * 0.45 + 0.1) // bonus for agreement
-    : Math.max(maConfidence, rsiConfidence) * 0.6; // penalty for disagreement
-
-  return {
-    fastMA,
-    slowMA,
-    maLean,
-    maConfidence,
-    justCrossedUp,
-    justCrossedDown,
-    rsi,
-    rsiLean,
-    rsiConfidence,
-    compositeLean,
-    overallConfidence,
-    agree,
-  };
-}
-
-// ---------- Accumulators analysis engine ----------
-// Composite of recent volatility/range (breach risk) + tick-count survival
-// stats (how long price has historically stayed within a comparable range).
-
-function analyzeAccumulators(prices) {
-  if (prices.length < RANGE_LOOKBACK + 5) return null;
-
-  const recent = prices.slice(-RANGE_LOOKBACK);
-  const returns = [];
-  for (let i = 1; i < recent.length; i++) {
-    returns.push(Math.abs((recent[i] - recent[i - 1]) / recent[i - 1]));
-  }
-  const avgReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
-  const maxReturn = Math.max(...returns);
-  const variance = returns.reduce((a, b) => a + Math.pow(b - avgReturn, 2), 0) / returns.length;
-  const stdDev = Math.sqrt(variance);
-
-  // Lower recent volatility -> lower near-term breach risk -> higher safe-to-continue confidence
-  // Normalize against a rough "typical" volatility baseline derived from the data itself
-  const volatilityScore = Math.min(1, stdDev / (avgReturn + 1e-9) / 3); // relative dispersion, 0 = very stable, 1 = erratic
-  const stabilityConfidence = Math.max(0.1, Math.min(0.9, 1 - volatilityScore));
-
-  // Survival stats: over the longer lookback, what fraction of rolling windows
-  // stayed within a band comparable to current typical movement?
-  const survivalWindow = prices.slice(-SURVIVAL_LOOKBACK);
-  const band = avgReturn * 3; // treat 3x avg tick-to-tick move as a reasonable barrier proxy
-  let survivedWindows = 0;
-  let totalWindows = 0;
-  const windowSize = 10;
-  for (let i = 0; i + windowSize <= survivalWindow.length; i++) {
-    const w = survivalWindow.slice(i, i + windowSize);
-    const base = w[0];
-    const maxDeviation = Math.max(...w.map((p) => Math.abs((p - base) / base)));
-    totalWindows++;
-    if (maxDeviation <= band) survivedWindows++;
-  }
-  const survivalRate = totalWindows > 0 ? survivedWindows / totalWindows : 0.5;
-
-  const overallConfidence = Math.min(0.95, stabilityConfidence * 0.5 + survivalRate * 0.5);
-  const recommendation = overallConfidence >= 0.55 ? "FAVORABLE" : overallConfidence >= 0.4 ? "CAUTION" : "HIGH RISK";
-
-  return {
-    avgReturn,
-    maxReturn,
-    stdDev,
-    stabilityConfidence,
-    survivalRate,
-    survivedWindows,
-    totalWindows,
-    overallConfidence,
-    recommendation,
-  };
-}
-
-// ---------- Confidence bar ----------
-
-function ConfidenceBar({ value, label }) {
-  const pct = Math.round(value * 100);
-  const color = pct >= 65 ? "#3ecf8e" : pct >= 40 ? "#e0a83e" : "#5a6270";
+function Stat({ label, value, sub, tone }) {
+  const color = tone === "up" ? ACCENT : tone === "down" ? ACCENT2 : INK;
   return (
-    <div className="conf-bar">
-      <div className="conf-bar-track">
-        <div className="conf-bar-fill" style={{ width: `${pct}%`, background: color }} />
-      </div>
-      <span className="conf-bar-label">{label ?? `${pct}%`}</span>
+    <div style={{ borderLeft: `2px solid ${LINE}`, paddingLeft: 12 }}>
+      <div style={{ fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", color: "#8a8574", fontFamily: "'JetBrains Mono', monospace" }}>{label}</div>
+      <div style={{ fontSize: 24, fontWeight: 600, color, fontFamily: "'Fraunces', serif", marginTop: 2 }}>{value}</div>
+      {sub && <div style={{ fontSize: 12, color: "#8a8574", marginTop: 2 }}>{sub}</div>}
     </div>
   );
 }
 
-// ---------- Main App ----------
-
-export default function DerivAnalysisApp() {
-  const [apiToken, setApiToken] = useState("");
-  const [appId, setAppId] = useState("");
-  const [accountId, setAccountId] = useState("");
-  const [connectionState, setConnectionState] = useState("disconnected"); // disconnected | connecting | connected | error
+export default function DerivBacktester() {
+  const [symbol, setSymbol] = useState("R_75");
+  const [product, setProduct] = useState("riseFall");
+  const [status, setStatus] = useState("idle"); // idle | connecting | fetching | running | done | error
   const [errorMsg, setErrorMsg] = useState("");
-  const [balance, setBalance] = useState(null);
-  const [currency, setCurrency] = useState("");
-  const [activeSymbol, setActiveSymbol] = useState("R_100");
-  const [mode, setMode] = useState(MODES.DIGITS);
-  const [digitStreams, setDigitStreams] = useState({}); // symbol -> array of last digits
-  const [priceStreams, setPriceStreams] = useState({}); // symbol -> array of raw prices
-  const [lastTick, setLastTick] = useState({}); // symbol -> {quote, epoch}
-  const [autoTrade, setAutoTrade] = useState(false);
-  const [stake, setStake] = useState(1);
-  const [tradeLog, setTradeLog] = useState([]);
-  const [pendingContracts, setPendingContracts] = useState({});
+  const [result, setResult] = useState(null);
+  const [dataInfo, setDataInfo] = useState(null);
+  const wsRef = useRef(null);
 
-  const publicWsRef = useRef(null); // market data, no auth
-  const authWsRef = useRef(null); // account-bound calls, via OTP
-  const reqIdRef = useRef(1);
-  const subscribedRef = useRef(new Set());
-  const autoTradeRef = useRef(autoTrade);
-  const lastSignalRef = useRef({}); // symbol -> last acted signal key, to avoid duplicate fires
-  const stakeRef = useRef(stake);
-  const otpRefreshTimerRef = useRef(null);
+  // Rise/Fall params
+  const [rfParams, setRfParams] = useState({ emaFast: 9, emaSlow: 21, rsiPeriod: 14, rsiUpper: 70, rsiLower: 30, stake: 10, payout: 1.85, duration: 5, granularity: 60 });
+  // Over/Under params
+  const [ouParams, setOuParams] = useState({ lookback: 50, deviationThreshold: 0.06, barrier: 4, mode: "meanReversion", stake: 10, payout: 1.9, pipSize: 2, count: 5000 });
 
-  useEffect(() => {
-    autoTradeRef.current = autoTrade;
-  }, [autoTrade]);
-  useEffect(() => {
-    stakeRef.current = stake;
-  }, [stake]);
-
-  const nextReqId = () => reqIdRef.current++;
-
-  const sendAuth = useCallback((payload) => {
-    if (authWsRef.current && authWsRef.current.readyState === WebSocket.OPEN) {
-      authWsRef.current.send(JSON.stringify(payload));
-    }
-  }, []);
-
-  const sendPublic = useCallback((payload) => {
-    if (publicWsRef.current && publicWsRef.current.readyState === WebSocket.OPEN) {
-      publicWsRef.current.send(JSON.stringify(payload));
-    }
-  }, []);
-
-  // Handles all authenticated messages (balance, buy, proposal_open_contract)
-  const handleAuthMessage = useCallback(
-    (msg) => {
-      if (msg.msg_type === "balance" && msg.balance) {
-        setBalance(msg.balance.balance);
-        setCurrency(msg.balance.currency);
-      }
-
-      if (msg.msg_type === "buy") {
-        if (msg.error) {
-          setTradeLog((prev) => [
-            { time: new Date().toLocaleTimeString(), symbol: activeSymbol, result: "ERROR", detail: msg.error.message },
-            ...prev,
-          ].slice(0, 50));
-        } else {
-          const c = msg.buy;
-          setTradeLog((prev) => [
-            {
-              time: new Date().toLocaleTimeString(),
-              symbol: activeSymbol,
-              result: "PLACED",
-              detail: `Contract ${c.contract_id} · stake ${c.buy_price} · payout ${c.payout}`,
-            },
-            ...prev,
-          ].slice(0, 50));
-          setPendingContracts((prev) => ({ ...prev, [c.contract_id]: true }));
-          sendAuth({ proposal_open_contract: 1, contract_id: c.contract_id, subscribe: 1, req_id: nextReqId() });
-        }
-      }
-
-      if (msg.msg_type === "proposal_open_contract" && msg.proposal_open_contract) {
-        const poc = msg.proposal_open_contract;
-        if (poc.is_sold) {
-          const profit = Number(poc.profit);
-          setTradeLog((prev) => [
-            {
-              time: new Date().toLocaleTimeString(),
-              symbol: poc.underlying || activeSymbol,
-              result: profit >= 0 ? "WIN" : "LOSS",
-              detail: `Contract ${poc.contract_id} · P/L ${profit.toFixed(2)}`,
-            },
-            ...prev,
-          ].slice(0, 50));
-        }
-      }
-
-      if (msg.error && msg.msg_type !== "buy") {
-        setErrorMsg(msg.error.message);
-      }
-    },
-    [activeSymbol, sendAuth]
-  );
-
-  // Fetch a fresh OTP-embedded WebSocket URL and connect the authenticated socket.
-  // OTPs are short-lived, so this is called both at startup and periodically to refresh.
-  const connectAuthSocket = useCallback(
-    async (accId) => {
-      try {
-        const res = await fetch(`https://api.derivws.com/trading/v1/options/accounts/${accId}/otp`, {
-          method: "POST",
-          headers: {
-            "Deriv-App-ID": appId,
-            Authorization: `Bearer ${apiToken}`,
-          },
-        });
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(`OTP request failed (${res.status}): ${text}`);
-        }
-        const json = await res.json();
-        // Deriv's OTP response is nested: { data: { url: "wss://..." } }
-        const wsUrl = json?.data?.url || json?.url || json?.websocket_url || json?.ws_url;
-        if (!wsUrl) throw new Error("OTP response did not include a WebSocket URL.");
-
-        const ws = new WebSocket(wsUrl);
-        authWsRef.current = ws;
-
-        ws.onopen = () => {
-          setConnectionState("connected");
-          setErrorMsg("");
-          sendAuth({ balance: 1, subscribe: 1, req_id: nextReqId() });
-        };
-
-        ws.onmessage = (event) => {
-          const msg = JSON.parse(event.data);
-          handleAuthMessage(msg);
-        };
-
-        ws.onerror = () => {
-          setErrorMsg("Authenticated WebSocket connection error.");
-        };
-
-        ws.onclose = () => {
-          // OTP sockets are short-lived; reconnect automatically if we're still meant to be connected
-          if (connectionState === "connected") {
-            connectAuthSocket(accId);
-          }
-        };
-      } catch (err) {
-        setErrorMsg(err.message || "Failed to establish authenticated connection.");
-        setConnectionState("error");
-      }
-    },
-    [apiToken, appId, sendAuth, handleAuthMessage, connectionState]
-  );
-
-  const connect = useCallback(() => {
-    if (!apiToken) {
-      setErrorMsg("Enter your Deriv API token first.");
-      return;
-    }
-    if (!appId) {
-      setErrorMsg("Enter your Deriv-App-ID (from a PAT-type app) first.");
-      return;
-    }
-    if (!accountId) {
-      setErrorMsg("Enter your account ID (e.g. CR123456 or VRTC123456) first.");
-      return;
-    }
+  const run = useCallback(async () => {
+    setStatus("connecting");
     setErrorMsg("");
-    setConnectionState("connecting");
+    setResult(null);
+    try {
+      const ws = await connectDeriv();
+      wsRef.current = ws;
+      setStatus("fetching");
 
-    // Public socket: market data only, no auth needed
-    const pws = new WebSocket(`wss://api.derivws.com/trading/v1/options/ws/public?app_id=${appId}`);
-    publicWsRef.current = pws;
-
-    pws.onopen = () => {
-      VOLATILITY_SYMBOLS.forEach((s) => {
-        sendPublic({ ticks: s.code, subscribe: 1, req_id: nextReqId() });
-        subscribedRef.current.add(s.code);
-      });
-    };
-
-    pws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.msg_type === "tick" && msg.tick) {
-        const { symbol, quote, epoch } = msg.tick;
-        const lastDigit = Number(quote.toString().slice(-1));
-        setLastTick((prev) => ({ ...prev, [symbol]: { quote, epoch } }));
-        setDigitStreams((prev) => {
-          const existing = prev[symbol] || [];
-          const updated = [...existing, lastDigit].slice(-TICK_HISTORY);
-          return { ...prev, [symbol]: updated };
-        });
-        setPriceStreams((prev) => {
-          const existing = prev[symbol] || [];
-          const updated = [...existing, quote].slice(-TICK_HISTORY);
-          return { ...prev, [symbol]: updated };
-        });
+      if (product === "riseFall") {
+        const resp = await requestCandles(ws, symbol, rfParams.granularity, 3000);
+        const candles = resp.candles.map((c) => ({ open: +c.open, high: +c.high, low: +c.low, close: +c.close, epoch: c.epoch }));
+        setDataInfo({ count: candles.length, kind: "candles", granularity: rfParams.granularity });
+        setStatus("running");
+        await new Promise((r) => setTimeout(r, 50));
+        const res = backtestRiseFall(candles, rfParams);
+        setResult({ product: "riseFall", ...res });
+      } else {
+        const resp = await requestTicksHistory(ws, symbol, ouParams.count);
+        const times = resp.history.times;
+        const prices = resp.history.prices;
+        const ticks = prices.map((p, idx) => ({ quote: +p, epoch: times[idx] }));
+        setDataInfo({ count: ticks.length, kind: "ticks" });
+        setStatus("running");
+        await new Promise((r) => setTimeout(r, 50));
+        const res = backtestOverUnder(ticks, ouParams);
+        setResult({ product: "overUnder", ...res });
       }
-    };
+      setStatus("done");
+      ws.close();
+    } catch (e) {
+      setErrorMsg(e.message || String(e));
+      setStatus("error");
+    }
+  }, [symbol, product, rfParams, ouParams]);
 
-    pws.onerror = () => {
-      setErrorMsg("Public WebSocket (market data) connection error.");
-    };
-
-    // Authenticated socket: obtained via REST OTP call, used for balance/buy/portfolio
-    connectAuthSocket(accountId);
-  }, [apiToken, appId, accountId, sendPublic, connectAuthSocket]);
-
-  const disconnect = () => {
-    if (publicWsRef.current) publicWsRef.current.close();
-    if (authWsRef.current) authWsRef.current.close();
-    if (otpRefreshTimerRef.current) clearInterval(otpRefreshTimerRef.current);
-    setConnectionState("disconnected");
-  };
-
-  // Contract type mapping for digit-based trades
-  const placeTrade = useCallback(
-    (contractType, barrier, symbol) => {
-      const req = {
-        buy: 1,
-        price: stakeRef.current,
-        parameters: {
-          amount: stakeRef.current,
-          basis: "stake",
-          contract_type: contractType,
-          currency: currency || "USD",
-          duration: 1,
-          duration_unit: "t",
-          symbol: symbol,
-          ...(barrier !== undefined ? { barrier: String(barrier) } : {}),
-        },
-        req_id: nextReqId(),
-      };
-      sendAuth(req);
-    },
-    [sendAuth, currency]
-  );
-
-  // Composite signal per active symbol, depends on selected mode
-  const activeDigits = digitStreams[activeSymbol] || [];
-  const activePrices = priceStreams[activeSymbol] || [];
-  const digitSignal = mode === MODES.DIGITS ? composite(activeDigits) : null;
-  const riseFallSignal = mode === MODES.RISE_FALL ? analyzeRiseFall(activePrices) : null;
-  const accumulatorSignal = mode === MODES.ACCUMULATORS ? analyzeAccumulators(activePrices) : null;
-
-  // Auto-trade effect: fire when a new high-confidence signal appears (digits mode)
-  useEffect(() => {
-    if (mode !== MODES.DIGITS) return;
-    if (!digitSignal) return;
-    if (!autoTradeRef.current) return;
-    if (connectionState !== "connected") return;
-
-    const key = `${digitSignal.matchesLean}-${digitSignal.evenOddLean}-${digitSignal.overUnderLean}-${activeDigits.length}`;
-    if (lastSignalRef.current[activeSymbol] === key) return;
-    if (digitSignal.overallConfidence < 0.55) return;
-
-    lastSignalRef.current[activeSymbol] = key;
-
-    const options = [
-      { type: digitSignal.matchesLean === "MATCHES" ? "DIGITMATCH" : "DIGITDIFF", conf: digitSignal.matchesConfidence, barrier: digitSignal.topDigit },
-      { type: digitSignal.evenOddLean === "EVEN" ? "DIGITEVEN" : "DIGITODD", conf: digitSignal.parityConfidence, barrier: undefined },
-      { type: digitSignal.overUnderLean === "OVER 5" ? "DIGITOVER" : "DIGITUNDER", conf: digitSignal.ouConfidence, barrier: 5 },
-    ];
-    const best = options.reduce((a, b) => (b.conf > a.conf ? b : a));
-    placeTrade(best.type, best.barrier, activeSymbol);
-  }, [mode, digitSignal, activeSymbol, connectionState, placeTrade, activeDigits.length]);
-
-  // Auto-trade effect: Rise/Fall mode
-  useEffect(() => {
-    if (mode !== MODES.RISE_FALL) return;
-    if (!riseFallSignal) return;
-    if (!autoTradeRef.current) return;
-    if (connectionState !== "connected") return;
-
-    const key = `${riseFallSignal.compositeLean}-${activePrices.length}`;
-    if (lastSignalRef.current[activeSymbol] === key) return;
-    if (riseFallSignal.overallConfidence < 0.55) return;
-
-    lastSignalRef.current[activeSymbol] = key;
-    placeTrade(riseFallSignal.compositeLean === "RISE" ? "CALL" : "PUT", undefined, activeSymbol);
-  }, [mode, riseFallSignal, activeSymbol, connectionState, placeTrade, activePrices.length]);
-
-  useEffect(() => {
-    return () => {
-      if (publicWsRef.current) publicWsRef.current.close();
-      if (authWsRef.current) authWsRef.current.close();
-    };
-  }, []);
-
-  const tick = lastTick[activeSymbol];
+  const isBusy = status === "connecting" || status === "fetching" || status === "running";
 
   return (
-    <div className="app">
-      <style>{styles}</style>
+    <div style={{ minHeight: "100vh", background: PAPER, color: INK, fontFamily: "'Inter', -apple-system, sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+        input[type=number], select { font-family: 'JetBrains Mono', monospace; }
+        ::selection { background: ${ACCENT}; color: white; }
+      `}</style>
 
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">◈</span>
-          <span className="brand-name">DIGIT SCAN</span>
-          <span className="brand-sub">deriv live analysis</span>
+      {/* Header */}
+      <div style={{ borderBottom: `1px solid ${LINE}`, padding: "24px 32px" }}>
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.15em", color: ACCENT, textTransform: "uppercase" }}>Strategy Ledger</div>
+            <h1 style={{ fontFamily: "'Fraunces', serif", fontSize: 32, fontWeight: 700, margin: "4px 0 0" }}>Deriv Backtester</h1>
+          </div>
+          <div style={{ fontSize: 13, color: "#8a8574", maxWidth: 360, textAlign: "right" }}>
+            Rules-based strategy testing against real historical data. No forward guarantees — this measures edge, not luck.
+          </div>
         </div>
+      </div>
 
-        <div className="conn-controls">
-          {connectionState !== "connected" ? (
-            <>
-              <input
-                type="text"
-                placeholder="Deriv-App-ID (from PAT app)"
-                value={appId}
-                onChange={(e) => setAppId(e.target.value)}
-                className="appid-input"
-              />
-              <input
-                type="text"
-                placeholder="Account ID (e.g. CR123456)"
-                value={accountId}
-                onChange={(e) => setAccountId(e.target.value)}
-                className="appid-input"
-              />
-              <input
-                type="password"
-                placeholder="Deriv PAT token"
-                value={apiToken}
-                onChange={(e) => setApiToken(e.target.value)}
-                className="token-input"
-              />
-              <button className="btn btn-primary" onClick={connect} disabled={connectionState === "connecting"}>
-                {connectionState === "connecting" ? "Connecting…" : "Connect"}
-              </button>
-            </>
-          ) : (
-            <>
-              <div className="balance-pill">
-                <span className="dot dot-live" />
-                {balance !== null ? `${Number(balance).toFixed(2)} ${currency}` : "—"}
+      <div style={{ display: "grid", gridTemplateColumns: "340px 1fr", gap: 0, minHeight: "calc(100vh - 89px)" }}>
+        {/* Control panel */}
+        <div style={{ borderRight: `1px solid ${LINE}`, padding: 24, display: "flex", flexDirection: "column", gap: 20 }}>
+          <div>
+            <label style={labelStyle}>Market</label>
+            <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={selectStyle}>
+              {SYMBOLS.map((s) => <option key={s.code} value={s.code}>{s.label}</option>)}
+            </select>
+          </div>
+
+          <div>
+            <label style={labelStyle}>Product / Strategy</label>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => setProduct("riseFall")} style={tabStyle(product === "riseFall")}>Rise / Fall</button>
+              <button onClick={() => setProduct("overUnder")} style={tabStyle(product === "overUnder")}>Over / Under</button>
+            </div>
+          </div>
+
+          {product === "riseFall" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <Field label="EMA Fast" value={rfParams.emaFast} onChange={(v) => setRfParams({ ...rfParams, emaFast: v })} />
+              <Field label="EMA Slow" value={rfParams.emaSlow} onChange={(v) => setRfParams({ ...rfParams, emaSlow: v })} />
+              <Field label="RSI Period" value={rfParams.rsiPeriod} onChange={(v) => setRfParams({ ...rfParams, rsiPeriod: v })} />
+              <Field label="RSI Upper (skip Rise above)" value={rfParams.rsiUpper} onChange={(v) => setRfParams({ ...rfParams, rsiUpper: v })} />
+              <Field label="RSI Lower (skip Fall below)" value={rfParams.rsiLower} onChange={(v) => setRfParams({ ...rfParams, rsiLower: v })} />
+              <Field label="Candle Granularity (sec)" value={rfParams.granularity} onChange={(v) => setRfParams({ ...rfParams, granularity: v })} />
+              <Field label="Hold Duration (candles)" value={rfParams.duration} onChange={(v) => setRfParams({ ...rfParams, duration: v })} />
+              <Field label="Stake" value={rfParams.stake} onChange={(v) => setRfParams({ ...rfParams, stake: v })} step={1} />
+              <Field label="Payout multiple" value={rfParams.payout} onChange={(v) => setRfParams({ ...rfParams, payout: v })} step={0.01} />
+            </div>
+          )}
+
+          {product === "overUnder" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div>
+                <label style={labelStyle}>Mode</label>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => setOuParams({ ...ouParams, mode: "meanReversion" })} style={tabStyle(ouParams.mode === "meanReversion")}>Mean Reversion</button>
+                  <button onClick={() => setOuParams({ ...ouParams, mode: "momentum" })} style={tabStyle(ouParams.mode === "momentum")}>Momentum</button>
+                </div>
               </div>
-              <button className="btn btn-ghost" onClick={disconnect}>
-                Disconnect
-              </button>
-            </>
+              <Field label="Lookback window (ticks)" value={ouParams.lookback} onChange={(v) => setOuParams({ ...ouParams, lookback: v })} />
+              <Field label="Deviation threshold" value={ouParams.deviationThreshold} onChange={(v) => setOuParams({ ...ouParams, deviationThreshold: v })} step={0.01} />
+              <Field label="Barrier digit (0-8)" value={ouParams.barrier} onChange={(v) => setOuParams({ ...ouParams, barrier: v })} />
+              <Field label="Tick sample size" value={ouParams.count} onChange={(v) => setOuParams({ ...ouParams, count: v })} step={500} />
+              <Field label="Stake" value={ouParams.stake} onChange={(v) => setOuParams({ ...ouParams, stake: v })} step={1} />
+              <Field label="Payout multiple" value={ouParams.payout} onChange={(v) => setOuParams({ ...ouParams, payout: v })} step={0.01} />
+            </div>
+          )}
+
+          <button onClick={run} disabled={isBusy} style={runButtonStyle(isBusy)}>
+            {isBusy ? <Loader2 size={16} className="spin" style={{ animation: "spin 1s linear infinite" }} /> : <Play size={16} />}
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            {status === "connecting" && "Connecting to Deriv…"}
+            {status === "fetching" && "Fetching historical data…"}
+            {status === "running" && "Running backtest…"}
+            {(status === "idle" || status === "done" || status === "error") && "Run Backtest"}
+          </button>
+
+          <div style={{ fontSize: 12, color: "#8a8574", display: "flex", gap: 8, alignItems: "flex-start", lineHeight: 1.5 }}>
+            <Info size={14} style={{ flexShrink: 0, marginTop: 2 }} />
+            <span>Pulls public historical data directly from Deriv's WebSocket API — no account token needed for backtesting.</span>
+          </div>
+
+          {status === "error" && (
+            <div style={{ background: "#fbeae6", border: `1px solid ${ACCENT2}`, borderRadius: 4, padding: 12, fontSize: 13, color: ACCENT2, display: "flex", gap: 8 }}>
+              <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+              {errorMsg}
+            </div>
           )}
         </div>
-      </header>
 
-      {errorMsg && <div className="error-banner">{errorMsg}</div>}
-
-      {connectionState !== "connected" ? (
-        <div className="empty-state">
-          <p className="empty-title">Not connected</p>
-          <p className="empty-body">
-            Enter your Deriv-App-ID (from a PAT-type app registered on developers.deriv.com), your account ID
-            (e.g. CR123456 for real, VRTC123456 for demo), and your PAT token, then connect. Market data streams
-            over the public endpoint immediately; account calls (balance, trading) connect via a short-lived OTP
-            fetched with your token.
-          </p>
-        </div>
-      ) : (
-        <div className="layout">
-          <aside className="symbol-list">
-            <div className="panel-label">Markets</div>
-            {VOLATILITY_SYMBOLS.map((s) => {
-              const d = digitStreams[s.code] || [];
-              const t = lastTick[s.code];
-              return (
-                <button
-                  key={s.code}
-                  className={`symbol-row ${activeSymbol === s.code ? "symbol-row-active" : ""}`}
-                  onClick={() => setActiveSymbol(s.code)}
-                >
-                  <div className="symbol-name">{s.label}</div>
-                  <div className="symbol-meta">
-                    <span className="symbol-quote">{t ? t.quote : "—"}</span>
-                    <span className="symbol-ticks">{d.length} ticks</span>
-                  </div>
-                </button>
-              );
-            })}
-          </aside>
-
-          <main className="main-panel">
-            <div className="mode-tabs">
-              <button className={`mode-tab ${mode === MODES.DIGITS ? "mode-tab-active" : ""}`} onClick={() => setMode(MODES.DIGITS)}>
-                Digits
-              </button>
-              <button className={`mode-tab ${mode === MODES.RISE_FALL ? "mode-tab-active" : ""}`} onClick={() => setMode(MODES.RISE_FALL)}>
-                Rise / Fall
-              </button>
-              <button className={`mode-tab ${mode === MODES.ACCUMULATORS ? "mode-tab-active" : ""}`} onClick={() => setMode(MODES.ACCUMULATORS)}>
-                Accumulators
-              </button>
+        {/* Results */}
+        <div style={{ padding: 32 }}>
+          {!result && status !== "error" && (
+            <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#b3ac97", gap: 12, paddingTop: 100 }}>
+              <Activity size={40} strokeWidth={1} />
+              <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18 }}>Configure a strategy and run a backtest</div>
+              <div style={{ fontSize: 13, maxWidth: 320, textAlign: "center" }}>Results — win rate, expectancy, drawdown, equity curve — will render here against real historical ticks.</div>
             </div>
+          )}
 
-            <div className="panel-header">
+          {result && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 28 }}>
               <div>
-                <div className="panel-title">{VOLATILITY_SYMBOLS.find((s) => s.code === activeSymbol)?.label}</div>
-                <div className="panel-quote">{tick ? tick.quote : "waiting for ticks…"}</div>
+                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.1em", color: "#8a8574", textTransform: "uppercase", marginBottom: 4 }}>
+                  {SYMBOLS.find(s => s.code === symbol)?.label} · {product === "riseFall" ? "Rise/Fall EMA+RSI Trend" : `Over/Under ${ouParams.mode === "meanReversion" ? "Mean Reversion" : "Momentum"}`}
+                </div>
+                {dataInfo && <div style={{ fontSize: 13, color: "#8a8574" }}>{dataInfo.count.toLocaleString()} {dataInfo.kind} analyzed{dataInfo.granularity ? ` · ${dataInfo.granularity}s candles` : ""}</div>}
               </div>
-              {mode === MODES.DIGITS && (
-                <div className="digit-strip">
-                  {activeDigits.slice(-20).map((d, i) => (
-                    <span key={i} className={`digit-chip ${d === activeDigits[activeDigits.length - 1] && i === activeDigits.slice(-20).length - 1 ? "digit-chip-last" : ""}`}>
-                      {d}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </div>
 
-            {mode === MODES.DIGITS && !digitSignal && (
-              <div className="empty-state">
-                <p className="empty-title">Gathering data</p>
-                <p className="empty-body">Need at least {FREQ_LOOKBACK} ticks for the composite signal. {activeDigits.length}/{FREQ_LOOKBACK} collected.</p>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 20 }}>
+                <Stat label="Trades" value={result.trades.length} />
+                <Stat label="Win Rate" value={`${result.winRate.toFixed(1)}%`} tone={result.winRate >= 50 ? "up" : "down"} />
+                <Stat label="Net P&L" value={`$${result.totalPnl.toFixed(2)}`} tone={result.totalPnl >= 0 ? "up" : "down"} />
+                <Stat label="Profit Factor" value={result.profitFactor === Infinity ? "∞" : result.profitFactor.toFixed(2)} tone={result.profitFactor >= 1 ? "up" : "down"} />
+                <Stat label="Max Drawdown" value={`$${result.maxDD.toFixed(2)}`} tone="down" />
+                <Stat label="Avg P&L / Trade" value={`$${result.avgPnl.toFixed(2)}`} tone={result.avgPnl >= 0 ? "up" : "down"} />
               </div>
-            )}
 
-            {mode === MODES.DIGITS && digitSignal && (
-              <>
-                <div className="signal-grid">
-                  <div className="signal-card">
-                    <div className="signal-card-label">Even / Odd</div>
-                    <div className="signal-card-value">{digitSignal.evenOddLean}</div>
-                    <div className="signal-card-sub">streak: {digitSignal.parityStreak}</div>
-                    <ConfidenceBar value={digitSignal.parityConfidence} />
-                    <div className="signal-actions">
-                      <button className="btn btn-buy" onClick={() => placeTrade("DIGITEVEN", undefined, activeSymbol)}>Buy Even</button>
-                      <button className="btn btn-sell" onClick={() => placeTrade("DIGITODD", undefined, activeSymbol)}>Buy Odd</button>
-                    </div>
-                  </div>
-
-                  <div className="signal-card">
-                    <div className="signal-card-label">Over / Under 5</div>
-                    <div className="signal-card-value">{digitSignal.overUnderLean}</div>
-                    <div className="signal-card-sub">streak: {digitSignal.ouStreak}</div>
-                    <ConfidenceBar value={digitSignal.ouConfidence} />
-                    <div className="signal-actions">
-                      <button className="btn btn-buy" onClick={() => placeTrade("DIGITOVER", 5, activeSymbol)}>Buy Over</button>
-                      <button className="btn btn-sell" onClick={() => placeTrade("DIGITUNDER", 5, activeSymbol)}>Buy Under</button>
-                    </div>
-                  </div>
-
-                  <div className="signal-card">
-                    <div className="signal-card-label">Matches / Differs</div>
-                    <div className="signal-card-value">{digitSignal.matchesLean} {digitSignal.topDigit}</div>
-                    <div className="signal-card-sub">match rate: {(digitSignal.matchRate * 100).toFixed(0)}%</div>
-                    <ConfidenceBar value={digitSignal.matchesConfidence} />
-                    <div className="signal-actions">
-                      <button className="btn btn-buy" onClick={() => placeTrade("DIGITMATCH", digitSignal.topDigit, activeSymbol)}>Buy Matches</button>
-                      <button className="btn btn-sell" onClick={() => placeTrade("DIGITDIFF", digitSignal.topDigit, activeSymbol)}>Buy Differs</button>
-                    </div>
-                  </div>
-
-                  <div className="signal-card signal-card-composite">
-                    <div className="signal-card-label">Composite recommendation</div>
-                    <div className="signal-card-value composite-value">Digit {digitSignal.topDigit}</div>
-                    <div className="signal-card-sub">blended across all 3 sub-signals</div>
-                    <ConfidenceBar value={digitSignal.overallConfidence} label={`${Math.round(digitSignal.overallConfidence * 100)}% confidence`} />
-                  </div>
-                </div>
-
-                <div className="freq-panel">
-                  <div className="panel-label">Digit frequency (last {FREQ_LOOKBACK} ticks)</div>
-                  <div className="freq-bars">
-                    {digitSignal.freqCounts.map((c, d) => (
-                      <div key={d} className="freq-bar-col">
-                        <div className="freq-bar" style={{ height: `${Math.max(4, (c / Math.max(...digitSignal.freqCounts)) * 60)}px` }} />
-                        <span className="freq-bar-label">{d}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </>
-            )}
-
-            {mode === MODES.RISE_FALL && !riseFallSignal && (
-              <div className="empty-state">
-                <p className="empty-title">Gathering data</p>
-                <p className="empty-body">Need at least {MA_SLOW + 1} ticks for moving averages. {activePrices.length}/{MA_SLOW + 1} collected.</p>
-              </div>
-            )}
-
-            {mode === MODES.RISE_FALL && riseFallSignal && (
-              <div className="signal-grid">
-                <div className="signal-card">
-                  <div className="signal-card-label">MA Crossover ({MA_FAST} / {MA_SLOW})</div>
-                  <div className="signal-card-value">{riseFallSignal.maLean}</div>
-                  <div className="signal-card-sub">
-                    {riseFallSignal.justCrossedUp || riseFallSignal.justCrossedDown ? "fresh crossover" : "trend continuing"} · fast {riseFallSignal.fastMA.toFixed(3)} / slow {riseFallSignal.slowMA.toFixed(3)}
-                  </div>
-                  <ConfidenceBar value={riseFallSignal.maConfidence} />
-                </div>
-
-                <div className="signal-card">
-                  <div className="signal-card-label">RSI ({RSI_PERIOD})</div>
-                  <div className="signal-card-value">{riseFallSignal.rsiLean}</div>
-                  <div className="signal-card-sub">RSI: {riseFallSignal.rsi.toFixed(1)} {riseFallSignal.rsi >= 70 ? "(overbought)" : riseFallSignal.rsi <= 30 ? "(oversold)" : "(neutral)"}</div>
-                  <ConfidenceBar value={riseFallSignal.rsiConfidence} />
-                </div>
-
-                <div className="signal-card signal-card-composite">
-                  <div className="signal-card-label">Composite recommendation</div>
-                  <div className="signal-card-value composite-value">{riseFallSignal.compositeLean}</div>
-                  <div className="signal-card-sub">{riseFallSignal.agree ? "MA and RSI agree" : "MA and RSI disagree — lower confidence"}</div>
-                  <ConfidenceBar value={riseFallSignal.overallConfidence} label={`${Math.round(riseFallSignal.overallConfidence * 100)}% confidence`} />
-                  <div className="signal-actions">
-                    <button className="btn btn-buy" onClick={() => placeTrade("CALL", undefined, activeSymbol)}>Buy Rise</button>
-                    <button className="btn btn-sell" onClick={() => placeTrade("PUT", undefined, activeSymbol)}>Buy Fall</button>
-                  </div>
+              <div>
+                <div style={{ fontSize: 12, letterSpacing: "0.08em", textTransform: "uppercase", color: "#8a8574", fontFamily: "'JetBrains Mono', monospace", marginBottom: 8 }}>Equity Curve</div>
+                <div style={{ background: "white", border: `1px solid ${LINE}`, borderRadius: 6, padding: "16px 8px" }}>
+                  <ResponsiveContainer width="100%" height={260}>
+                    <AreaChart data={result.equityCurve}>
+                      <defs>
+                        <linearGradient id="eq" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor={result.totalPnl >= 0 ? ACCENT : ACCENT2} stopOpacity={0.25} />
+                          <stop offset="95%" stopColor={result.totalPnl >= 0 ? ACCENT : ACCENT2} stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="2 4" stroke={LINE} />
+                      <XAxis dataKey="i" tick={{ fontSize: 11, fill: "#8a8574" }} axisLine={{ stroke: LINE }} tickLine={false} />
+                      <YAxis tick={{ fontSize: 11, fill: "#8a8574" }} axisLine={{ stroke: LINE }} tickLine={false} width={60} />
+                      <Tooltip contentStyle={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, border: `1px solid ${LINE}`, borderRadius: 4 }} />
+                      <ReferenceLine y={0} stroke={LINE} />
+                      <Area type="monotone" dataKey="equity" stroke={result.totalPnl >= 0 ? ACCENT : ACCENT2} fill="url(#eq)" strokeWidth={1.5} />
+                    </AreaChart>
+                  </ResponsiveContainer>
                 </div>
               </div>
-            )}
 
-            {mode === MODES.ACCUMULATORS && !accumulatorSignal && (
-              <div className="empty-state">
-                <p className="empty-title">Gathering data</p>
-                <p className="empty-body">Need at least {RANGE_LOOKBACK + 5} ticks for range analysis. {activePrices.length}/{RANGE_LOOKBACK + 5} collected.</p>
-              </div>
-            )}
-
-            {mode === MODES.ACCUMULATORS && accumulatorSignal && (
-              <div className="signal-grid">
-                <div className="signal-card">
-                  <div className="signal-card-label">Volatility / Range</div>
-                  <div className="signal-card-value">{(accumulatorSignal.stabilityConfidence * 100).toFixed(0)}% stable</div>
-                  <div className="signal-card-sub">avg move: {(accumulatorSignal.avgReturn * 100).toFixed(3)}% · max move: {(accumulatorSignal.maxReturn * 100).toFixed(3)}%</div>
-                  <ConfidenceBar value={accumulatorSignal.stabilityConfidence} />
-                </div>
-
-                <div className="signal-card">
-                  <div className="signal-card-label">Barrier survival (last {SURVIVAL_LOOKBACK} ticks)</div>
-                  <div className="signal-card-value">{(accumulatorSignal.survivalRate * 100).toFixed(0)}%</div>
-                  <div className="signal-card-sub">{accumulatorSignal.survivedWindows}/{accumulatorSignal.totalWindows} windows stayed in comparable range</div>
-                  <ConfidenceBar value={accumulatorSignal.survivalRate} />
-                </div>
-
-                <div className="signal-card signal-card-composite">
-                  <div className="signal-card-label">Composite recommendation</div>
-                  <div className="signal-card-value composite-value">{accumulatorSignal.recommendation}</div>
-                  <div className="signal-card-sub">blend of stability + survival stats — no auto-trade for this mode yet</div>
-                  <ConfidenceBar value={accumulatorSignal.overallConfidence} label={`${Math.round(accumulatorSignal.overallConfidence * 100)}% confidence`} />
-                </div>
-              </div>
-            )}
-
-            <div className="exec-panel">
-              <div className="panel-label">Execution</div>
-              <div className="exec-controls">
-                <label className="exec-field">
-                  Stake
-                  <input
-                    type="number"
-                    min="0.35"
-                    step="0.01"
-                    value={stake}
-                    onChange={(e) => setStake(parseFloat(e.target.value) || 0)}
-                  />
-                </label>
-                <label className="switch-field">
-                  <span>Auto-trade this market</span>
-                  <button
-                    className={`switch ${autoTrade ? "switch-on" : ""}`}
-                    onClick={() => setAutoTrade((v) => !v)}
-                    aria-pressed={autoTrade}
-                  >
-                    <span className="switch-knob" />
-                  </button>
-                </label>
-              </div>
-              {autoTrade && (
-                <p className="exec-note">
-                  Auto-trade fires the highest-confidence sub-signal when overall confidence ≥ 55%. No stake sizing or loss limits are applied yet — every fire uses the stake above.
+              <div style={{ background: result.totalPnl >= 0 ? "#eef4ec" : "#fbeae6", border: `1px solid ${result.totalPnl >= 0 ? ACCENT : ACCENT2}`, borderRadius: 6, padding: 16, fontSize: 13, lineHeight: 1.6 }}>
+                <strong style={{ fontFamily: "'Fraunces', serif", fontSize: 15 }}>Reading this result</strong>
+                <p style={{ margin: "8px 0 0" }}>
+                  A profit factor above 1.0 means the strategy made more on wins than it lost on losses over this sample — but on {result.trades.length} trades, this could still be within the range of chance. Deriv's synthetic indices have a built-in house edge (typically reflected in the payout multiple below 1/probability), so a strategy needs a real, persistent statistical edge — not just a lucky window — to be viable long-term. Re-run across different symbols, time windows, and parameter values before trusting any single result.
                 </p>
-              )}
+              </div>
             </div>
-
-            <div className="log-panel">
-              <div className="panel-label">Trade log</div>
-              {tradeLog.length === 0 ? (
-                <p className="empty-body">No trades yet.</p>
-              ) : (
-                <div className="log-list">
-                  {tradeLog.map((t, i) => (
-                    <div key={i} className={`log-row log-${t.result.toLowerCase()}`}>
-                      <span className="log-time">{t.time}</span>
-                      <span className="log-symbol">{t.symbol}</span>
-                      <span className="log-result">{t.result}</span>
-                      <span className="log-detail">{t.detail}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </main>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
 }
 
-const styles = `
-  * { box-sizing: border-box; }
-  .app {
-    background: #0b0e12;
-    color: #d7dbe0;
-    font-family: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
-    min-height: 100vh;
-    padding: 0;
-  }
-  .topbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 16px 24px;
-    border-bottom: 1px solid #1c2128;
-    flex-wrap: wrap;
-    gap: 12px;
-  }
-  .brand { display: flex; align-items: baseline; gap: 10px; }
-  .brand-mark { color: #3ecf8e; font-size: 20px; }
-  .brand-name { font-weight: 700; letter-spacing: 0.08em; font-size: 15px; }
-  .brand-sub { color: #5a6270; font-size: 12px; }
-  .conn-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .token-input, .appid-input {
-    background: #12161c;
-    border: 1px solid #262d38;
-    color: #d7dbe0;
-    padding: 8px 10px;
-    border-radius: 4px;
-    font-family: inherit;
-    font-size: 13px;
-  }
-  .token-input { width: 220px; max-width: 100%; }
-  .appid-input { width: 140px; max-width: 100%; }
-  .btn {
-    padding: 8px 16px;
-    border-radius: 4px;
-    border: 1px solid #262d38;
-    background: #12161c;
-    color: #d7dbe0;
-    font-family: inherit;
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .btn:hover { border-color: #3a4250; }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-primary { background: #3ecf8e; color: #0b0e12; border-color: #3ecf8e; font-weight: 600; }
-  .btn-ghost { background: transparent; }
-  .btn-buy { background: #16362a; border-color: #2c5c46; color: #6fe0ab; flex: 1; }
-  .btn-sell { background: #3a1c1c; border-color: #5c2c2c; color: #e08787; flex: 1; }
-  .balance-pill {
-    background: #12161c;
-    border: 1px solid #262d38;
-    padding: 8px 14px;
-    border-radius: 999px;
-    font-size: 13px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
-  .dot-live { background: #3ecf8e; box-shadow: 0 0 6px #3ecf8e; }
-  .error-banner {
-    background: #3a1c1c;
-    color: #e08787;
-    padding: 10px 24px;
-    font-size: 13px;
-    border-bottom: 1px solid #5c2c2c;
-  }
-  .empty-state { padding: 60px 24px; text-align: center; }
-  .empty-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
-  .empty-body { color: #5a6270; font-size: 13px; max-width: 480px; margin: 0 auto; }
-  .layout { display: grid; grid-template-columns: 260px 1fr; min-height: calc(100vh - 60px); }
-  .symbol-list { border-right: 1px solid #1c2128; padding: 16px 12px; overflow-y: auto; }
-  .panel-label {
-    color: #5a6270;
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    margin-bottom: 10px;
-  }
-  .symbol-row {
-    display: block;
-    width: 100%;
-    text-align: left;
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 4px;
-    padding: 10px 12px;
-    color: #d7dbe0;
-    cursor: pointer;
-    margin-bottom: 4px;
-    font-family: inherit;
-  }
-  .symbol-row:hover { background: #12161c; }
-  .symbol-row-active { background: #12161c; border-color: #262d38; }
-  .symbol-name { font-size: 12.5px; margin-bottom: 4px; }
-  .symbol-meta { display: flex; justify-content: space-between; font-size: 11px; color: #5a6270; }
-  .symbol-quote { color: #8b93a1; }
-  .main-panel { padding: 24px; overflow-y: auto; }
-  .mode-tabs { display: flex; gap: 6px; margin-bottom: 20px; }
-  .mode-tab {
-    background: #12161c;
-    border: 1px solid #1c2128;
-    color: #8b93a1;
-    padding: 8px 16px;
-    border-radius: 6px;
-    font-family: inherit;
-    font-size: 12.5px;
-    cursor: pointer;
-  }
-  .mode-tab-active { border-color: #3ecf8e; color: #3ecf8e; background: #101b16; }
-  .panel-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-end;
-    flex-wrap: wrap;
-    gap: 16px;
-    margin-bottom: 24px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid #1c2128;
-  }
-  .panel-title { font-size: 16px; font-weight: 600; }
-  .panel-quote { font-size: 26px; color: #3ecf8e; margin-top: 4px; }
-  .digit-strip { display: flex; gap: 4px; flex-wrap: wrap; max-width: 420px; }
-  .digit-chip {
-    width: 22px; height: 22px;
-    display: flex; align-items: center; justify-content: center;
-    background: #12161c;
-    border: 1px solid #262d38;
-    border-radius: 3px;
-    font-size: 11px;
-    color: #8b93a1;
-  }
-  .digit-chip-last { border-color: #3ecf8e; color: #3ecf8e; }
-  .signal-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 24px; }
-  .signal-card {
-    background: #12161c;
-    border: 1px solid #1c2128;
-    border-radius: 6px;
-    padding: 16px;
-  }
-  .signal-card-composite { border-color: #2c5c46; background: #101b16; }
-  .signal-card-label { font-size: 11px; color: #5a6270; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
-  .signal-card-value { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
-  .composite-value { color: #3ecf8e; }
-  .signal-card-sub { font-size: 11.5px; color: #5a6270; margin-bottom: 10px; }
-  .conf-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-  .conf-bar-track { flex: 1; height: 6px; background: #1c2128; border-radius: 3px; overflow: hidden; }
-  .conf-bar-fill { height: 100%; border-radius: 3px; }
-  .conf-bar-label { font-size: 11px; color: #8b93a1; white-space: nowrap; }
-  .signal-actions { display: flex; gap: 8px; }
-  .freq-panel { background: #12161c; border: 1px solid #1c2128; border-radius: 6px; padding: 16px; margin-bottom: 24px; }
-  .freq-bars { display: flex; gap: 8px; align-items: flex-end; height: 80px; }
-  .freq-bar-col { display: flex; flex-direction: column; align-items: center; gap: 6px; flex: 1; }
-  .freq-bar { width: 100%; background: #3ecf8e; border-radius: 2px 2px 0 0; opacity: 0.75; }
-  .freq-bar-label { font-size: 11px; color: #5a6270; }
-  .exec-panel { background: #12161c; border: 1px solid #1c2128; border-radius: 6px; padding: 16px; margin-bottom: 24px; }
-  .exec-controls { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
-  .exec-field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #8b93a1; }
-  .exec-field input {
-    background: #0b0e12; border: 1px solid #262d38; color: #d7dbe0;
-    padding: 8px 10px; border-radius: 4px; font-family: inherit; width: 100px;
-  }
-  .switch-field { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: #8b93a1; }
-  .switch {
-    width: 40px; height: 22px; border-radius: 999px;
-    background: #262d38; border: none; position: relative; cursor: pointer;
-    padding: 0;
-  }
-  .switch-on { background: #2c5c46; }
-  .switch-knob {
-    position: absolute; top: 2px; left: 2px;
-    width: 18px; height: 18px; border-radius: 50%;
-    background: #8b93a1; transition: left 0.15s ease;
-  }
-  .switch-on .switch-knob { left: 20px; background: #3ecf8e; }
-  .exec-note { font-size: 11.5px; color: #e0a83e; margin-top: 12px; }
-  .log-panel { background: #12161c; border: 1px solid #1c2128; border-radius: 6px; padding: 16px; }
-  .log-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
-  .log-row {
-    display: grid; grid-template-columns: 80px 140px 70px 1fr;
-    gap: 10px; font-size: 11.5px; padding: 8px 10px;
-    background: #0b0e12; border-radius: 4px; align-items: center;
-  }
-  .log-time { color: #5a6270; }
-  .log-symbol { color: #8b93a1; }
-  .log-result { font-weight: 700; }
-  .log-win .log-result { color: #3ecf8e; }
-  .log-loss .log-result { color: #e08787; }
-  .log-placed .log-result { color: #e0a83e; }
-  .log-error .log-result { color: #e08787; }
-  .log-detail { color: #8b93a1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+function Field({ label, value, onChange, step = 1 }) {
+  return (
+    <div>
+      <label style={labelStyle}>{label}</label>
+      <input
+        type="number"
+        value={value}
+        step={step}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        style={inputStyle}
+      />
+    </div>
+  );
+}
 
-  @media (max-width: 720px) {
-    .topbar { padding: 12px 14px; }
-    .brand-sub { display: none; }
-    .conn-controls { width: 100%; }
-    .token-input, .appid-input { width: 100%; min-width: 0; flex: 1 1 140px; }
-    .layout { grid-template-columns: 1fr; }
-    .symbol-list {
-      border-right: none;
-      border-bottom: 1px solid #1c2128;
-      display: flex;
-      overflow-x: auto;
-      padding: 12px;
-      gap: 8px;
-    }
-    .symbol-list .panel-label { display: none; }
-    .symbol-row { flex: 0 0 auto; min-width: 150px; margin-bottom: 0; }
-    .main-panel { padding: 16px; }
-    .mode-tabs { flex-wrap: wrap; }
-    .mode-tab { flex: 1 1 auto; text-align: center; }
-    .panel-header { flex-direction: column; align-items: flex-start; }
-    .digit-strip { max-width: 100%; }
-    .signal-grid { grid-template-columns: 1fr; }
-    .signal-actions { flex-direction: column; }
-    .exec-controls { flex-direction: column; align-items: flex-start; gap: 14px; }
-    .log-row {
-      grid-template-columns: 1fr;
-      gap: 4px;
-    }
-    .log-detail { white-space: normal; }
-  }
+const labelStyle = {
+  display: "block",
+  fontSize: 11,
+  letterSpacing: "0.06em",
+  textTransform: "uppercase",
+  color: "#8a8574",
+  marginBottom: 6,
+  fontFamily: "'JetBrains Mono', monospace",
+};
 
-  @media (max-width: 420px) {
-    .brand-name { font-size: 13px; }
-    .balance-pill { font-size: 12px; padding: 6px 10px; }
-    .panel-quote { font-size: 20px; }
-  }
-`;
+const inputStyle = {
+  width: "100%",
+  padding: "8px 10px",
+  border: `1px solid ${LINE}`,
+  borderRadius: 4,
+  fontSize: 13,
+  background: "white",
+  color: INK,
+  boxSizing: "border-box",
+};
+
+const selectStyle = { ...inputStyle, fontFamily: "'JetBrains Mono', monospace" };
+
+function tabStyle(active) {
+  return {
+    flex: 1,
+    padding: "8px 10px",
+    fontSize: 12,
+    fontWeight: 600,
+    border: `1px solid ${active ? ACCENT : LINE}`,
+    background: active ? ACCENT : "white",
+    color: active ? "white" : INK,
+    borderRadius: 4,
+    cursor: "pointer",
+  };
+}
+
+function runButtonStyle(busy) {
+  return {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    padding: "12px 16px",
+    background: busy ? "#8a8574" : INK,
+    color: "white",
+    border: "none",
+    borderRadius: 4,
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: busy ? "default" : "pointer",
+    letterSpacing: "0.02em",
+  };
+}
