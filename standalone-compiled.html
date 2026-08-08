@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Digit Scan — Deriv Live Analysis</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+</head>
+<body>
+<div id="root">
+  <div style="padding:20px;font-family:monospace;color:#8b93a1;background:#0b0e12;min-height:100vh;">Loading…</div>
+</div>
+<div id="error-display" style="display:none;padding:20px;font-family:monospace;background:#3a1c1c;color:#e08787;white-space:pre-wrap;word-break:break-all;"></div>
+<script>
+  window.onerror = function(msg, url, line, col, error) {
+    var el = document.getElementById('error-display');
+    el.style.display = 'block';
+    el.textContent = 'JS ERROR: ' + msg + '\nLine: ' + line + ':' + col + '\n' + (error && error.stack ? error.stack : '');
+    return false;
+  };
+</script>
+<script>
+(() => {
+  const { useState, useEffect, useRef, useCallback } = React;
+  const VOLATILITY_SYMBOLS = [
+    { code: "R_10", label: "Volatility 10 Index" },
+    { code: "R_25", label: "Volatility 25 Index" },
+    { code: "R_50", label: "Volatility 50 Index" },
+    { code: "R_75", label: "Volatility 75 Index" },
+    { code: "R_100", label: "Volatility 100 Index" },
+    { code: "1HZ10V", label: "Volatility 10 (1s) Index" },
+    { code: "1HZ25V", label: "Volatility 25 (1s) Index" },
+    { code: "1HZ50V", label: "Volatility 50 (1s) Index" },
+    { code: "1HZ75V", label: "Volatility 75 (1s) Index" },
+    { code: "1HZ100V", label: "Volatility 100 (1s) Index" }
+  ];
+  const TICK_HISTORY = 120;
+  const STREAK_LOOKBACK = 20;
+  const FREQ_LOOKBACK = 50;
+  const MATCH_LOOKBACK = 30;
+  const MODES = {
+    DIGITS: "digits",
+    RISE_FALL: "rise_fall",
+    ACCUMULATORS: "accumulators"
+  };
+  const MA_FAST = 8;
+  const MA_SLOW = 21;
+  const RSI_PERIOD = 14;
+  const RANGE_LOOKBACK = 30;
+  const SURVIVAL_LOOKBACK = 60;
+  function analyzeStreaks(digits) {
+    const recent = digits.slice(-STREAK_LOOKBACK);
+    if (recent.length < 5) return null;
+    const parity = recent.map((d) => d % 2);
+    let streak = 1;
+    for (let i = parity.length - 1; i > 0; i--) {
+      if (parity[i] === parity[i - 1]) streak++;
+      else break;
+    }
+    const lastParity = parity[parity.length - 1];
+    const confidence = Math.min(0.9, 0.15 * streak);
+    const predictedParity = lastParity === 0 ? 1 : 0;
+    const overUnder = recent.map((d) => d > 4 ? 1 : 0);
+    let ouStreak = 1;
+    for (let i = overUnder.length - 1; i > 0; i--) {
+      if (overUnder[i] === overUnder[i - 1]) ouStreak++;
+      else break;
+    }
+    const lastOU = overUnder[overUnder.length - 1];
+    const ouConfidence = Math.min(0.9, 0.15 * ouStreak);
+    const predictedOU = lastOU === 0 ? 1 : 0;
+    return {
+      parityStreak: streak,
+      predictedParity,
+      // 0 even, 1 odd
+      parityConfidence: confidence,
+      ouStreak,
+      predictedOU,
+      // 0 under(0-4), 1 over(5-9)
+      ouConfidence
+    };
+  }
+  function analyzeFrequency(digits) {
+    const recent = digits.slice(-FREQ_LOOKBACK);
+    if (recent.length < 10) return null;
+    const counts = new Array(10).fill(0);
+    recent.forEach((d) => counts[d]++);
+    const expected = recent.length / 10;
+    const deviations = counts.map((c) => expected - c);
+    const maxDeviation = Math.max(...deviations.map(Math.abs), 1);
+    const scores = deviations.map((d) => Math.max(0, d) / maxDeviation);
+    return { counts, scores, expected };
+  }
+  function analyzeMatchesDiffers(digits) {
+    const recent = digits.slice(-MATCH_LOOKBACK);
+    if (recent.length < 5) return null;
+    const last = recent[recent.length - 1];
+    let matches = 0;
+    for (let i = 0; i < recent.length - 1; i++) {
+      if (recent[i] === last) matches++;
+    }
+    const matchRate = matches / (recent.length - 1);
+    const deviation = matchRate - 0.1;
+    return { last, matchRate, deviation };
+  }
+  function composite(digits) {
+    const streaks = analyzeStreaks(digits);
+    const freq = analyzeFrequency(digits);
+    const matches = analyzeMatchesDiffers(digits);
+    if (!streaks || !freq || !matches) return null;
+    const digitScores = new Array(10).fill(0).map((_, d) => {
+      let score = freq.scores[d] * 0.5;
+      const parity = d % 2;
+      if (parity === streaks.predictedParity) score += streaks.parityConfidence * 0.25;
+      const ou = d > 4 ? 1 : 0;
+      if (ou === streaks.predictedOU) score += streaks.ouConfidence * 0.25;
+      return score;
+    });
+    const topDigit = digitScores.indexOf(Math.max(...digitScores));
+    const topScore = digitScores[topDigit];
+    const matchesLean = matches.deviation > 0.03 ? "MATCHES" : "DIFFERS";
+    const matchesConfidence = Math.min(0.9, 0.5 + Math.abs(matches.deviation) * 3);
+    const evenOddLean = streaks.predictedParity === 0 ? "EVEN" : "ODD";
+    const overUnderLean = streaks.predictedOU === 1 ? "OVER 5" : "UNDER 5";
+    const overallConfidence = (topScore + streaks.parityConfidence + streaks.ouConfidence + matchesConfidence) / 4;
+    return {
+      topDigit,
+      topScore,
+      digitScores,
+      evenOddLean,
+      parityConfidence: streaks.parityConfidence,
+      overUnderLean,
+      ouConfidence: streaks.ouConfidence,
+      matchesLean,
+      matchesConfidence,
+      matchRate: matches.matchRate,
+      parityStreak: streaks.parityStreak,
+      ouStreak: streaks.ouStreak,
+      overallConfidence: Math.min(0.95, overallConfidence),
+      freqCounts: freq.counts
+    };
+  }
+  function sma(values, period) {
+    if (values.length < period) return null;
+    const slice = values.slice(-period);
+    return slice.reduce((a, b) => a + b, 0) / period;
+  }
+  function calcRSI(values, period) {
+    if (values.length < period + 1) return null;
+    const slice = values.slice(-(period + 1));
+    let gains = 0;
+    let losses = 0;
+    for (let i = 1; i < slice.length; i++) {
+      const diff = slice[i] - slice[i - 1];
+      if (diff > 0) gains += diff;
+      else losses += Math.abs(diff);
+    }
+    const avgGain = gains / period;
+    const avgLoss = losses / period;
+    if (avgLoss === 0) return 100;
+    const rs = avgGain / avgLoss;
+    return 100 - 100 / (1 + rs);
+  }
+  function analyzeRiseFall(prices) {
+    if (prices.length < MA_SLOW + 1) return null;
+    const fastMA = sma(prices, MA_FAST);
+    const slowMA = sma(prices, MA_SLOW);
+    const prevFastMA = sma(prices.slice(0, -1), MA_FAST);
+    const prevSlowMA = sma(prices.slice(0, -1), MA_SLOW);
+    if (fastMA === null || slowMA === null || prevFastMA === null || prevSlowMA === null) return null;
+    const wasBelowOrEqual = prevFastMA <= prevSlowMA;
+    const isAbove = fastMA > slowMA;
+    const justCrossedUp = wasBelowOrEqual && isAbove;
+    const justCrossedDown = !wasBelowOrEqual && !isAbove;
+    const maSeparation = Math.abs(fastMA - slowMA) / slowMA;
+    const maLean = isAbove ? "RISE" : "FALL";
+    let maConfidence = Math.min(0.85, maSeparation * 400);
+    if (justCrossedUp || justCrossedDown) maConfidence = Math.min(0.9, maConfidence + 0.15);
+    const rsi = calcRSI(prices, RSI_PERIOD);
+    if (rsi === null) return null;
+    let rsiLean, rsiConfidence;
+    if (rsi >= 70) {
+      rsiLean = "FALL";
+      rsiConfidence = Math.min(0.85, (rsi - 70) / 30 + 0.4);
+    } else if (rsi <= 30) {
+      rsiLean = "RISE";
+      rsiConfidence = Math.min(0.85, (30 - rsi) / 30 + 0.4);
+    } else {
+      rsiLean = rsi >= 50 ? "RISE" : "FALL";
+      rsiConfidence = Math.abs(rsi - 50) / 50 * 0.3;
+    }
+    const agree = maLean === rsiLean;
+    const compositeLean = agree ? maLean : maConfidence >= rsiConfidence ? maLean : rsiLean;
+    const overallConfidence = agree ? Math.min(0.95, maConfidence * 0.55 + rsiConfidence * 0.45 + 0.1) : Math.max(maConfidence, rsiConfidence) * 0.6;
+    return {
+      fastMA,
+      slowMA,
+      maLean,
+      maConfidence,
+      justCrossedUp,
+      justCrossedDown,
+      rsi,
+      rsiLean,
+      rsiConfidence,
+      compositeLean,
+      overallConfidence,
+      agree
+    };
+  }
+  function analyzeAccumulators(prices) {
+    if (prices.length < RANGE_LOOKBACK + 5) return null;
+    const recent = prices.slice(-RANGE_LOOKBACK);
+    const returns = [];
+    for (let i = 1; i < recent.length; i++) {
+      returns.push(Math.abs((recent[i] - recent[i - 1]) / recent[i - 1]));
+    }
+    const avgReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const maxReturn = Math.max(...returns);
+    const variance = returns.reduce((a, b) => a + Math.pow(b - avgReturn, 2), 0) / returns.length;
+    const stdDev = Math.sqrt(variance);
+    const volatilityScore = Math.min(1, stdDev / (avgReturn + 1e-9) / 3);
+    const stabilityConfidence = Math.max(0.1, Math.min(0.9, 1 - volatilityScore));
+    const survivalWindow = prices.slice(-SURVIVAL_LOOKBACK);
+    const band = avgReturn * 3;
+    let survivedWindows = 0;
+    let totalWindows = 0;
+    const windowSize = 10;
+    for (let i = 0; i + windowSize <= survivalWindow.length; i++) {
+      const w = survivalWindow.slice(i, i + windowSize);
+      const base = w[0];
+      const maxDeviation = Math.max(...w.map((p) => Math.abs((p - base) / base)));
+      totalWindows++;
+      if (maxDeviation <= band) survivedWindows++;
+    }
+    const survivalRate = totalWindows > 0 ? survivedWindows / totalWindows : 0.5;
+    const overallConfidence = Math.min(0.95, stabilityConfidence * 0.5 + survivalRate * 0.5);
+    const recommendation = overallConfidence >= 0.55 ? "FAVORABLE" : overallConfidence >= 0.4 ? "CAUTION" : "HIGH RISK";
+    return {
+      avgReturn,
+      maxReturn,
+      stdDev,
+      stabilityConfidence,
+      survivalRate,
+      survivedWindows,
+      totalWindows,
+      overallConfidence,
+      recommendation
+    };
+  }
+  function ConfidenceBar({ value, label }) {
+    const pct = Math.round(value * 100);
+    const color = pct >= 65 ? "#3ecf8e" : pct >= 40 ? "#e0a83e" : "#5a6270";
+    return /* @__PURE__ */ React.createElement("div", { className: "conf-bar" }, /* @__PURE__ */ React.createElement("div", { className: "conf-bar-track" }, /* @__PURE__ */ React.createElement("div", { className: "conf-bar-fill", style: { width: `${pct}%`, background: color } })), /* @__PURE__ */ React.createElement("span", { className: "conf-bar-label" }, label ?? `${pct}%`));
+  }
+  function DerivAnalysisApp() {
+    const [apiToken, setApiToken] = useState("");
+    const [appId, setAppId] = useState("");
+    const [accountId, setAccountId] = useState("");
+    const [connectionState, setConnectionState] = useState("disconnected");
+    const [errorMsg, setErrorMsg] = useState("");
+    const [balance, setBalance] = useState(null);
+    const [currency, setCurrency] = useState("");
+    const [loginId, setLoginId] = useState("");
+    const [activeSymbol, setActiveSymbol] = useState("R_100");
+    const [mode, setMode] = useState(MODES.DIGITS);
+    const [digitStreams, setDigitStreams] = useState({});
+    const [priceStreams, setPriceStreams] = useState({});
+    const [lastTick, setLastTick] = useState({});
+    const [autoTrade, setAutoTrade] = useState(false);
+    const [stake, setStake] = useState(1);
+    const [tradeLog, setTradeLog] = useState([]);
+    const publicWsRef = useRef(null);
+    const authWsRef = useRef(null);
+    const reqIdRef = useRef(1);
+    const shouldStayConnectedRef = useRef(false);
+    const autoTradeRef = useRef(autoTrade);
+    const lastSignalRef = useRef({});
+    const stakeRef = useRef(stake);
+    const activeSymbolRef = useRef(activeSymbol);
+    useEffect(() => {
+      autoTradeRef.current = autoTrade;
+    }, [autoTrade]);
+    useEffect(() => {
+      stakeRef.current = stake;
+    }, [stake]);
+    useEffect(() => {
+      activeSymbolRef.current = activeSymbol;
+    }, [activeSymbol]);
+    const nextReqId = () => reqIdRef.current++;
+    const sendAuth = useCallback((payload) => {
+      if (authWsRef.current && authWsRef.current.readyState === WebSocket.OPEN) {
+        authWsRef.current.send(JSON.stringify(payload));
+      }
+    }, []);
+    const sendPublic = useCallback((payload) => {
+      if (publicWsRef.current && publicWsRef.current.readyState === WebSocket.OPEN) {
+        publicWsRef.current.send(JSON.stringify(payload));
+      }
+    }, []);
+    const handleAuthMessage = useCallback((msg) => {
+      if (msg.msg_type === "balance" && msg.balance) {
+        setBalance(msg.balance.balance);
+        setCurrency(msg.balance.currency);
+        setLoginId(msg.balance.loginid || loginId);
+      }
+      if (msg.msg_type === "buy") {
+        if (msg.error) {
+          setTradeLog((prev) => [
+            { time: (/* @__PURE__ */ new Date()).toLocaleTimeString(), symbol: activeSymbolRef.current, result: "ERROR", detail: msg.error.message },
+            ...prev
+          ].slice(0, 50));
+        } else {
+          const c = msg.buy;
+          setTradeLog((prev) => [
+            {
+              time: (/* @__PURE__ */ new Date()).toLocaleTimeString(),
+              symbol: activeSymbolRef.current,
+              result: "PLACED",
+              detail: `Contract ${c.contract_id} \xB7 stake ${c.buy_price} \xB7 payout ${c.payout}`
+            },
+            ...prev
+          ].slice(0, 50));
+          sendAuth({ proposal_open_contract: 1, contract_id: c.contract_id, subscribe: 1, req_id: nextReqId() });
+        }
+      }
+      if (msg.msg_type === "proposal_open_contract" && msg.proposal_open_contract) {
+        const poc = msg.proposal_open_contract;
+        if (poc.is_sold) {
+          const profit = Number(poc.profit);
+          setTradeLog((prev) => [
+            {
+              time: (/* @__PURE__ */ new Date()).toLocaleTimeString(),
+              symbol: poc.underlying || activeSymbolRef.current,
+              result: profit >= 0 ? "WIN" : "LOSS",
+              detail: `Contract ${poc.contract_id} \xB7 P/L ${profit.toFixed(2)}`
+            },
+            ...prev
+          ].slice(0, 50));
+        }
+      }
+      if (msg.error && msg.msg_type !== "buy") {
+        setErrorMsg(msg.error.message);
+      }
+    }, [sendAuth, loginId]);
+    const connectAuthSocket = useCallback(async () => {
+      try {
+        const res = await fetch(
+          `https://api.derivws.com/trading/v1/options/accounts/${accountId}/otp`,
+          {
+            method: "POST",
+            headers: {
+              "Deriv-App-ID": appId,
+              Authorization: `Bearer ${apiToken}`
+            }
+          }
+        );
+        const text = await res.text();
+        if (!res.ok) {
+          throw new Error(`OTP request failed (${res.status}): ${text}`);
+        }
+        const json = JSON.parse(text);
+        const wsUrl = json?.data?.url || json?.url;
+        if (!wsUrl) throw new Error("OTP response did not include a WebSocket URL.");
+        const ws = new WebSocket(wsUrl);
+        authWsRef.current = ws;
+        ws.onopen = () => {
+          setConnectionState("connected");
+          setErrorMsg("");
+          sendAuth({ balance: 1, subscribe: 1, req_id: nextReqId() });
+        };
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data);
+          handleAuthMessage(msg);
+        };
+        ws.onerror = () => {
+          setErrorMsg("Authenticated WebSocket connection error.");
+        };
+        ws.onclose = () => {
+          if (shouldStayConnectedRef.current) {
+            setTimeout(() => {
+              if (shouldStayConnectedRef.current) connectAuthSocket();
+            }, 1e3);
+          }
+        };
+      } catch (err) {
+        setErrorMsg(err.message || "Failed to establish authenticated connection.");
+        setConnectionState("error");
+      }
+    }, [accountId, appId, apiToken, sendAuth, handleAuthMessage]);
+    const connect = useCallback(() => {
+      if (!apiToken) {
+        setErrorMsg("Enter your Deriv API token first.");
+        return;
+      }
+      if (!appId) {
+        setErrorMsg("Enter your registered app_id first (from developers.deriv.com \u2014 not 1089).");
+        return;
+      }
+      if (!accountId) {
+        setErrorMsg("Enter your account ID first (e.g. DOT93836244).");
+        return;
+      }
+      setErrorMsg("");
+      setConnectionState("connecting");
+      shouldStayConnectedRef.current = true;
+      const pws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=1089`);
+      publicWsRef.current = pws;
+      pws.onopen = () => {
+        setErrorMsg("");
+        VOLATILITY_SYMBOLS.forEach((s) => {
+          sendPublic({ ticks: s.code, subscribe: 1, req_id: nextReqId() });
+        });
+      };
+      pws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.error) {
+          setErrorMsg(`Market data error: ${msg.error.message} (code: ${msg.error.code})`);
+          return;
+        }
+        if (msg.msg_type === "tick" && msg.tick) {
+          const { symbol, quote, epoch } = msg.tick;
+          const lastDigit = Number(quote.toString().slice(-1));
+          setLastTick((prev) => ({ ...prev, [symbol]: { quote, epoch } }));
+          setDigitStreams((prev) => {
+            const existing = prev[symbol] || [];
+            const updated = [...existing, lastDigit].slice(-TICK_HISTORY);
+            return { ...prev, [symbol]: updated };
+          });
+          setPriceStreams((prev) => {
+            const existing = prev[symbol] || [];
+            const updated = [...existing, quote].slice(-TICK_HISTORY);
+            return { ...prev, [symbol]: updated };
+          });
+        }
+      };
+      pws.onerror = () => {
+        setErrorMsg("Public WebSocket (market data) connection error.");
+      };
+      pws.onclose = (e) => {
+        setErrorMsg(`Market data socket closed (code ${e.code}${e.reason ? ": " + e.reason : ""}). It may need a numeric app_id \u2014 try 1089 here even if your account requires a different app_id for OTP.`);
+      };
+      connectAuthSocket();
+    }, [apiToken, appId, accountId, sendPublic, connectAuthSocket]);
+    const disconnect = () => {
+      shouldStayConnectedRef.current = false;
+      if (publicWsRef.current) publicWsRef.current.close();
+      if (authWsRef.current) authWsRef.current.close();
+      setConnectionState("disconnected");
+    };
+    const placeTrade = useCallback(
+      (contractType, barrier, symbol) => {
+        const req = {
+          buy: 1,
+          price: stakeRef.current,
+          parameters: {
+            amount: stakeRef.current,
+            basis: "stake",
+            contract_type: contractType,
+            currency: currency || "USD",
+            duration: 1,
+            duration_unit: "t",
+            symbol,
+            ...barrier !== void 0 ? { barrier: String(barrier) } : {}
+          },
+          req_id: nextReqId()
+        };
+        sendAuth(req);
+      },
+      [sendAuth, currency]
+    );
+    const activeDigits = digitStreams[activeSymbol] || [];
+    const activePrices = priceStreams[activeSymbol] || [];
+    const digitSignal = mode === MODES.DIGITS ? composite(activeDigits) : null;
+    const riseFallSignal = mode === MODES.RISE_FALL ? analyzeRiseFall(activePrices) : null;
+    const accumulatorSignal = mode === MODES.ACCUMULATORS ? analyzeAccumulators(activePrices) : null;
+    useEffect(() => {
+      if (mode !== MODES.DIGITS) return;
+      if (!digitSignal) return;
+      if (!autoTradeRef.current) return;
+      if (connectionState !== "connected") return;
+      const key = `${digitSignal.matchesLean}-${digitSignal.evenOddLean}-${digitSignal.overUnderLean}-${activeDigits.length}`;
+      if (lastSignalRef.current[activeSymbol] === key) return;
+      if (digitSignal.overallConfidence < 0.55) return;
+      lastSignalRef.current[activeSymbol] = key;
+      const options = [
+        { type: digitSignal.matchesLean === "MATCHES" ? "DIGITMATCH" : "DIGITDIFF", conf: digitSignal.matchesConfidence, barrier: digitSignal.topDigit },
+        { type: digitSignal.evenOddLean === "EVEN" ? "DIGITEVEN" : "DIGITODD", conf: digitSignal.parityConfidence, barrier: void 0 },
+        { type: digitSignal.overUnderLean === "OVER 5" ? "DIGITOVER" : "DIGITUNDER", conf: digitSignal.ouConfidence, barrier: 5 }
+      ];
+      const best = options.reduce((a, b) => b.conf > a.conf ? b : a);
+      placeTrade(best.type, best.barrier, activeSymbol);
+    }, [mode, digitSignal, activeSymbol, connectionState, placeTrade, activeDigits.length]);
+    useEffect(() => {
+      if (mode !== MODES.RISE_FALL) return;
+      if (!riseFallSignal) return;
+      if (!autoTradeRef.current) return;
+      if (connectionState !== "connected") return;
+      const key = `${riseFallSignal.compositeLean}-${activePrices.length}`;
+      if (lastSignalRef.current[activeSymbol] === key) return;
+      if (riseFallSignal.overallConfidence < 0.55) return;
+      lastSignalRef.current[activeSymbol] = key;
+      placeTrade(riseFallSignal.compositeLean === "RISE" ? "CALL" : "PUT", void 0, activeSymbol);
+    }, [mode, riseFallSignal, activeSymbol, connectionState, placeTrade, activePrices.length]);
+    useEffect(() => {
+      return () => {
+        shouldStayConnectedRef.current = false;
+        if (publicWsRef.current) publicWsRef.current.close();
+        if (authWsRef.current) authWsRef.current.close();
+      };
+    }, []);
+    const tick = lastTick[activeSymbol];
+    return /* @__PURE__ */ React.createElement("div", { className: "app" }, /* @__PURE__ */ React.createElement("style", null, styles), /* @__PURE__ */ React.createElement("header", { className: "topbar" }, /* @__PURE__ */ React.createElement("div", { className: "brand" }, /* @__PURE__ */ React.createElement("span", { className: "brand-mark" }, "\u25C8"), /* @__PURE__ */ React.createElement("span", { className: "brand-name" }, "DIGIT SCAN"), /* @__PURE__ */ React.createElement("span", { className: "brand-sub" }, "deriv live analysis")), /* @__PURE__ */ React.createElement("div", { className: "conn-controls" }, connectionState !== "connected" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "text",
+        placeholder: "your app_id (developers.deriv.com)",
+        value: appId,
+        onChange: (e) => setAppId(e.target.value),
+        className: "appid-input"
+      }
+    ), /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "text",
+        placeholder: "Account ID (e.g. DOT93836244)",
+        value: accountId,
+        onChange: (e) => setAccountId(e.target.value),
+        className: "appid-input"
+      }
+    ), /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "password",
+        placeholder: "Deriv PAT token",
+        value: apiToken,
+        onChange: (e) => setApiToken(e.target.value),
+        className: "token-input"
+      }
+    ), /* @__PURE__ */ React.createElement("button", { className: "btn btn-primary", onClick: connect, disabled: connectionState === "connecting" }, connectionState === "connecting" ? "Connecting\u2026" : "Connect")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "balance-pill" }, /* @__PURE__ */ React.createElement("span", { className: "dot dot-live" }), loginId ? `${loginId} \xB7 ` : "", balance !== null ? `${Number(balance).toFixed(2)} ${currency}` : "\u2014"), /* @__PURE__ */ React.createElement("button", { className: "btn btn-ghost", onClick: disconnect }, "Disconnect")))), errorMsg && /* @__PURE__ */ React.createElement("div", { className: "error-banner" }, errorMsg), connectionState !== "connected" ? /* @__PURE__ */ React.createElement("div", { className: "empty-state" }, /* @__PURE__ */ React.createElement("p", { className: "empty-title" }, "Not connected"), /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "Enter your registered app_id (create a PAT-type app at developers.deriv.com \u2014 the shared app_id 1089 will not work here), your account ID (e.g. DOT93836244, from home.deriv.com), and your API token (from Settings \u2192 API management \u2192 API Token), then connect. Market data streams over a public socket immediately; account calls (balance, trading) connect via a short-lived OTP fetched with your token.")) : /* @__PURE__ */ React.createElement("div", { className: "layout" }, /* @__PURE__ */ React.createElement("aside", { className: "symbol-list" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Markets"), VOLATILITY_SYMBOLS.map((s) => {
+      const d = digitStreams[s.code] || [];
+      const t = lastTick[s.code];
+      return /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          key: s.code,
+          className: `symbol-row ${activeSymbol === s.code ? "symbol-row-active" : ""}`,
+          onClick: () => setActiveSymbol(s.code)
+        },
+        /* @__PURE__ */ React.createElement("div", { className: "symbol-name" }, s.label),
+        /* @__PURE__ */ React.createElement("div", { className: "symbol-meta" }, /* @__PURE__ */ React.createElement("span", { className: "symbol-quote" }, t ? t.quote : "\u2014"), /* @__PURE__ */ React.createElement("span", { className: "symbol-ticks" }, d.length, " ticks"))
+      );
+    })), /* @__PURE__ */ React.createElement("main", { className: "main-panel" }, /* @__PURE__ */ React.createElement("div", { className: "mode-tabs" }, /* @__PURE__ */ React.createElement("button", { className: `mode-tab ${mode === MODES.DIGITS ? "mode-tab-active" : ""}`, onClick: () => setMode(MODES.DIGITS) }, "Digits"), /* @__PURE__ */ React.createElement("button", { className: `mode-tab ${mode === MODES.RISE_FALL ? "mode-tab-active" : ""}`, onClick: () => setMode(MODES.RISE_FALL) }, "Rise / Fall"), /* @__PURE__ */ React.createElement("button", { className: `mode-tab ${mode === MODES.ACCUMULATORS ? "mode-tab-active" : ""}`, onClick: () => setMode(MODES.ACCUMULATORS) }, "Accumulators")), /* @__PURE__ */ React.createElement("div", { className: "panel-header" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "panel-title" }, VOLATILITY_SYMBOLS.find((s) => s.code === activeSymbol)?.label), /* @__PURE__ */ React.createElement("div", { className: "panel-quote" }, tick ? tick.quote : "waiting for ticks\u2026")), mode === MODES.DIGITS && /* @__PURE__ */ React.createElement("div", { className: "digit-strip" }, activeDigits.slice(-20).map((d, i) => /* @__PURE__ */ React.createElement("span", { key: i, className: `digit-chip ${d === activeDigits[activeDigits.length - 1] && i === activeDigits.slice(-20).length - 1 ? "digit-chip-last" : ""}` }, d)))), mode === MODES.DIGITS && !digitSignal && /* @__PURE__ */ React.createElement("div", { className: "empty-state" }, /* @__PURE__ */ React.createElement("p", { className: "empty-title" }, "Gathering data"), /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "Need at least ", FREQ_LOOKBACK, " ticks for the composite signal. ", activeDigits.length, "/", FREQ_LOOKBACK, " collected.")), mode === MODES.DIGITS && digitSignal && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "signal-grid" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "Even / Odd"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value" }, digitSignal.evenOddLean), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, "streak: ", digitSignal.parityStreak), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: digitSignal.parityConfidence }), /* @__PURE__ */ React.createElement("div", { className: "signal-actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn btn-buy", onClick: () => placeTrade("DIGITEVEN", void 0, activeSymbol) }, "Buy Even"), /* @__PURE__ */ React.createElement("button", { className: "btn btn-sell", onClick: () => placeTrade("DIGITODD", void 0, activeSymbol) }, "Buy Odd"))), /* @__PURE__ */ React.createElement("div", { className: "signal-card" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "Over / Under 5"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value" }, digitSignal.overUnderLean), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, "streak: ", digitSignal.ouStreak), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: digitSignal.ouConfidence }), /* @__PURE__ */ React.createElement("div", { className: "signal-actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn btn-buy", onClick: () => placeTrade("DIGITOVER", 5, activeSymbol) }, "Buy Over"), /* @__PURE__ */ React.createElement("button", { className: "btn btn-sell", onClick: () => placeTrade("DIGITUNDER", 5, activeSymbol) }, "Buy Under"))), /* @__PURE__ */ React.createElement("div", { className: "signal-card" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "Matches / Differs"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value" }, digitSignal.matchesLean, " ", digitSignal.topDigit), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, "match rate: ", (digitSignal.matchRate * 100).toFixed(0), "%"), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: digitSignal.matchesConfidence }), /* @__PURE__ */ React.createElement("div", { className: "signal-actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn btn-buy", onClick: () => placeTrade("DIGITMATCH", digitSignal.topDigit, activeSymbol) }, "Buy Matches"), /* @__PURE__ */ React.createElement("button", { className: "btn btn-sell", onClick: () => placeTrade("DIGITDIFF", digitSignal.topDigit, activeSymbol) }, "Buy Differs"))), /* @__PURE__ */ React.createElement("div", { className: "signal-card signal-card-composite" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "Composite recommendation"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value composite-value" }, "Digit ", digitSignal.topDigit), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, "blended across all 3 sub-signals"), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: digitSignal.overallConfidence, label: `${Math.round(digitSignal.overallConfidence * 100)}% confidence` }))), /* @__PURE__ */ React.createElement("div", { className: "freq-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Digit frequency (last ", FREQ_LOOKBACK, " ticks)"), /* @__PURE__ */ React.createElement("div", { className: "freq-bars" }, digitSignal.freqCounts.map((c, d) => /* @__PURE__ */ React.createElement("div", { key: d, className: "freq-bar-col" }, /* @__PURE__ */ React.createElement("div", { className: "freq-bar", style: { height: `${Math.max(4, c / Math.max(...digitSignal.freqCounts) * 60)}px` } }), /* @__PURE__ */ React.createElement("span", { className: "freq-bar-label" }, d)))))), mode === MODES.RISE_FALL && !riseFallSignal && /* @__PURE__ */ React.createElement("div", { className: "empty-state" }, /* @__PURE__ */ React.createElement("p", { className: "empty-title" }, "Gathering data"), /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "Need at least ", MA_SLOW + 1, " ticks for moving averages. ", activePrices.length, "/", MA_SLOW + 1, " collected.")), mode === MODES.RISE_FALL && riseFallSignal && /* @__PURE__ */ React.createElement("div", { className: "signal-grid" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "MA Crossover (", MA_FAST, " / ", MA_SLOW, ")"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value" }, riseFallSignal.maLean), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, riseFallSignal.justCrossedUp || riseFallSignal.justCrossedDown ? "fresh crossover" : "trend continuing", " \xB7 fast ", riseFallSignal.fastMA.toFixed(3), " / slow ", riseFallSignal.slowMA.toFixed(3)), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: riseFallSignal.maConfidence })), /* @__PURE__ */ React.createElement("div", { className: "signal-card" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "RSI (", RSI_PERIOD, ")"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value" }, riseFallSignal.rsiLean), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, "RSI: ", riseFallSignal.rsi.toFixed(1), " ", riseFallSignal.rsi >= 70 ? "(overbought)" : riseFallSignal.rsi <= 30 ? "(oversold)" : "(neutral)"), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: riseFallSignal.rsiConfidence })), /* @__PURE__ */ React.createElement("div", { className: "signal-card signal-card-composite" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "Composite recommendation"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value composite-value" }, riseFallSignal.compositeLean), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, riseFallSignal.agree ? "MA and RSI agree" : "MA and RSI disagree \u2014 lower confidence"), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: riseFallSignal.overallConfidence, label: `${Math.round(riseFallSignal.overallConfidence * 100)}% confidence` }), /* @__PURE__ */ React.createElement("div", { className: "signal-actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn btn-buy", onClick: () => placeTrade("CALL", void 0, activeSymbol) }, "Buy Rise"), /* @__PURE__ */ React.createElement("button", { className: "btn btn-sell", onClick: () => placeTrade("PUT", void 0, activeSymbol) }, "Buy Fall")))), mode === MODES.ACCUMULATORS && !accumulatorSignal && /* @__PURE__ */ React.createElement("div", { className: "empty-state" }, /* @__PURE__ */ React.createElement("p", { className: "empty-title" }, "Gathering data"), /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "Need at least ", RANGE_LOOKBACK + 5, " ticks for range analysis. ", activePrices.length, "/", RANGE_LOOKBACK + 5, " collected.")), mode === MODES.ACCUMULATORS && accumulatorSignal && /* @__PURE__ */ React.createElement("div", { className: "signal-grid" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "Volatility / Range"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value" }, (accumulatorSignal.stabilityConfidence * 100).toFixed(0), "% stable"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, "avg move: ", (accumulatorSignal.avgReturn * 100).toFixed(3), "% \xB7 max move: ", (accumulatorSignal.maxReturn * 100).toFixed(3), "%"), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: accumulatorSignal.stabilityConfidence })), /* @__PURE__ */ React.createElement("div", { className: "signal-card" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "Barrier survival (last ", SURVIVAL_LOOKBACK, " ticks)"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value" }, (accumulatorSignal.survivalRate * 100).toFixed(0), "%"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, accumulatorSignal.survivedWindows, "/", accumulatorSignal.totalWindows, " windows stayed in comparable range"), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: accumulatorSignal.survivalRate })), /* @__PURE__ */ React.createElement("div", { className: "signal-card signal-card-composite" }, /* @__PURE__ */ React.createElement("div", { className: "signal-card-label" }, "Composite recommendation"), /* @__PURE__ */ React.createElement("div", { className: "signal-card-value composite-value" }, accumulatorSignal.recommendation), /* @__PURE__ */ React.createElement("div", { className: "signal-card-sub" }, "blend of stability + survival stats \u2014 no auto-trade for this mode yet"), /* @__PURE__ */ React.createElement(ConfidenceBar, { value: accumulatorSignal.overallConfidence, label: `${Math.round(accumulatorSignal.overallConfidence * 100)}% confidence` }))), /* @__PURE__ */ React.createElement("div", { className: "exec-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Execution"), /* @__PURE__ */ React.createElement("div", { className: "exec-controls" }, /* @__PURE__ */ React.createElement("label", { className: "exec-field" }, "Stake", /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "number",
+        min: "0.35",
+        step: "0.01",
+        value: stake,
+        onChange: (e) => setStake(parseFloat(e.target.value) || 0)
+      }
+    )), /* @__PURE__ */ React.createElement("label", { className: "switch-field" }, /* @__PURE__ */ React.createElement("span", null, "Auto-trade this market"), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        className: `switch ${autoTrade ? "switch-on" : ""}`,
+        onClick: () => setAutoTrade((v) => !v),
+        "aria-pressed": autoTrade
+      },
+      /* @__PURE__ */ React.createElement("span", { className: "switch-knob" })
+    ))), autoTrade && /* @__PURE__ */ React.createElement("p", { className: "exec-note" }, "Auto-trade fires the highest-confidence sub-signal when overall confidence \u2265 55%. No stake sizing or loss limits are applied yet \u2014 every fire uses the stake above.")), /* @__PURE__ */ React.createElement("div", { className: "log-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Trade log"), tradeLog.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "No trades yet.") : /* @__PURE__ */ React.createElement("div", { className: "log-list" }, tradeLog.map((t, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: `log-row log-${t.result.toLowerCase()}` }, /* @__PURE__ */ React.createElement("span", { className: "log-time" }, t.time), /* @__PURE__ */ React.createElement("span", { className: "log-symbol" }, t.symbol), /* @__PURE__ */ React.createElement("span", { className: "log-result" }, t.result), /* @__PURE__ */ React.createElement("span", { className: "log-detail" }, t.detail))))))));
+  }
+  const styles = `
+  * { box-sizing: border-box; }
+  .app {
+    background: #0b0e12;
+    color: #d7dbe0;
+    font-family: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
+    min-height: 100vh;
+    padding: 0;
+  }
+  .topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 24px;
+    border-bottom: 1px solid #1c2128;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand-mark { color: #3ecf8e; font-size: 20px; }
+  .brand-name { font-weight: 700; letter-spacing: 0.08em; font-size: 15px; }
+  .brand-sub { color: #5a6270; font-size: 12px; }
+  .conn-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .token-input, .appid-input {
+    background: #12161c;
+    border: 1px solid #262d38;
+    color: #d7dbe0;
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 13px;
+  }
+  .token-input { width: 220px; max-width: 100%; }
+  .appid-input { width: 140px; max-width: 100%; }
+  .btn {
+    padding: 8px 16px;
+    border-radius: 4px;
+    border: 1px solid #262d38;
+    background: #12161c;
+    color: #d7dbe0;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .btn:hover { border-color: #3a4250; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: #3ecf8e; color: #0b0e12; border-color: #3ecf8e; font-weight: 600; }
+  .btn-ghost { background: transparent; }
+  .btn-buy { background: #16362a; border-color: #2c5c46; color: #6fe0ab; flex: 1; }
+  .btn-sell { background: #3a1c1c; border-color: #5c2c2c; color: #e08787; flex: 1; }
+  .balance-pill {
+    background: #12161c;
+    border: 1px solid #262d38;
+    padding: 8px 14px;
+    border-radius: 999px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .dot-live { background: #3ecf8e; box-shadow: 0 0 6px #3ecf8e; }
+  .error-banner {
+    background: #3a1c1c;
+    color: #e08787;
+    padding: 10px 24px;
+    font-size: 13px;
+    border-bottom: 1px solid #5c2c2c;
+  }
+  .empty-state { padding: 60px 24px; text-align: center; }
+  .empty-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+  .empty-body { color: #5a6270; font-size: 13px; max-width: 480px; margin: 0 auto; }
+  .layout { display: grid; grid-template-columns: 260px 1fr; min-height: calc(100vh - 60px); }
+  .symbol-list { border-right: 1px solid #1c2128; padding: 16px 12px; overflow-y: auto; }
+  .panel-label {
+    color: #5a6270;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .symbol-row {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 10px 12px;
+    color: #d7dbe0;
+    cursor: pointer;
+    margin-bottom: 4px;
+    font-family: inherit;
+  }
+  .symbol-row:hover { background: #12161c; }
+  .symbol-row-active { background: #12161c; border-color: #262d38; }
+  .symbol-name { font-size: 12.5px; margin-bottom: 4px; }
+  .symbol-meta { display: flex; justify-content: space-between; font-size: 11px; color: #5a6270; }
+  .symbol-quote { color: #8b93a1; }
+  .main-panel { padding: 24px; overflow-y: auto; }
+  .mode-tabs { display: flex; gap: 6px; margin-bottom: 20px; }
+  .mode-tab {
+    background: #12161c;
+    border: 1px solid #1c2128;
+    color: #8b93a1;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .mode-tab-active { border-color: #3ecf8e; color: #3ecf8e; background: #101b16; }
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #1c2128;
+  }
+  .panel-title { font-size: 16px; font-weight: 600; }
+  .panel-quote { font-size: 26px; color: #3ecf8e; margin-top: 4px; }
+  .digit-strip { display: flex; gap: 4px; flex-wrap: wrap; max-width: 420px; }
+  .digit-chip {
+    width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center;
+    background: #12161c;
+    border: 1px solid #262d38;
+    border-radius: 3px;
+    font-size: 11px;
+    color: #8b93a1;
+  }
+  .digit-chip-last { border-color: #3ecf8e; color: #3ecf8e; }
+  .signal-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .signal-card {
+    background: #12161c;
+    border: 1px solid #1c2128;
+    border-radius: 6px;
+    padding: 16px;
+  }
+  .signal-card-composite { border-color: #2c5c46; background: #101b16; }
+  .signal-card-label { font-size: 11px; color: #5a6270; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+  .signal-card-value { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+  .composite-value { color: #3ecf8e; }
+  .signal-card-sub { font-size: 11.5px; color: #5a6270; margin-bottom: 10px; }
+  .conf-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .conf-bar-track { flex: 1; height: 6px; background: #1c2128; border-radius: 3px; overflow: hidden; }
+  .conf-bar-fill { height: 100%; border-radius: 3px; }
+  .conf-bar-label { font-size: 11px; color: #8b93a1; white-space: nowrap; }
+  .signal-actions { display: flex; gap: 8px; }
+  .freq-panel { background: #12161c; border: 1px solid #1c2128; border-radius: 6px; padding: 16px; margin-bottom: 24px; }
+  .freq-bars { display: flex; gap: 8px; align-items: flex-end; height: 80px; }
+  .freq-bar-col { display: flex; flex-direction: column; align-items: center; gap: 6px; flex: 1; }
+  .freq-bar { width: 100%; background: #3ecf8e; border-radius: 2px 2px 0 0; opacity: 0.75; }
+  .freq-bar-label { font-size: 11px; color: #5a6270; }
+  .exec-panel { background: #12161c; border: 1px solid #1c2128; border-radius: 6px; padding: 16px; margin-bottom: 24px; }
+  .exec-controls { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+  .exec-field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #8b93a1; }
+  .exec-field input {
+    background: #0b0e12; border: 1px solid #262d38; color: #d7dbe0;
+    padding: 8px 10px; border-radius: 4px; font-family: inherit; width: 100px;
+  }
+  .switch-field { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: #8b93a1; }
+  .switch {
+    width: 40px; height: 22px; border-radius: 999px;
+    background: #262d38; border: none; position: relative; cursor: pointer;
+    padding: 0;
+  }
+  .switch-on { background: #2c5c46; }
+  .switch-knob {
+    position: absolute; top: 2px; left: 2px;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: #8b93a1; transition: left 0.15s ease;
+  }
+  .switch-on .switch-knob { left: 20px; background: #3ecf8e; }
+  .exec-note { font-size: 11.5px; color: #e0a83e; margin-top: 12px; }
+  .log-panel { background: #12161c; border: 1px solid #1c2128; border-radius: 6px; padding: 16px; }
+  .log-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
+  .log-row {
+    display: grid; grid-template-columns: 80px 140px 70px 1fr;
+    gap: 10px; font-size: 11.5px; padding: 8px 10px;
+    background: #0b0e12; border-radius: 4px; align-items: center;
+  }
+  .log-time { color: #5a6270; }
+  .log-symbol { color: #8b93a1; }
+  .log-result { font-weight: 700; }
+  .log-win .log-result { color: #3ecf8e; }
+  .log-loss .log-result { color: #e08787; }
+  .log-placed .log-result { color: #e0a83e; }
+  .log-error .log-result { color: #e08787; }
+  .log-detail { color: #8b93a1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  @media (max-width: 720px) {
+    .topbar { padding: 12px 14px; }
+    .brand-sub { display: none; }
+    .conn-controls { width: 100%; }
+    .token-input, .appid-input { width: 100%; min-width: 0; flex: 1 1 140px; }
+    .layout { grid-template-columns: 1fr; }
+    .symbol-list {
+      border-right: none;
+      border-bottom: 1px solid #1c2128;
+      display: flex;
+      overflow-x: auto;
+      padding: 12px;
+      gap: 8px;
+    }
+    .symbol-list .panel-label { display: none; }
+    .symbol-row { flex: 0 0 auto; min-width: 150px; margin-bottom: 0; }
+    .main-panel { padding: 16px; }
+    .mode-tabs { flex-wrap: wrap; }
+    .mode-tab { flex: 1 1 auto; text-align: center; }
+    .panel-header { flex-direction: column; align-items: flex-start; }
+    .digit-strip { max-width: 100%; }
+    .signal-grid { grid-template-columns: 1fr; }
+    .signal-actions { flex-direction: column; }
+    .exec-controls { flex-direction: column; align-items: flex-start; gap: 14px; }
+    .log-row {
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+    .log-detail { white-space: normal; }
+  }
+
+  @media (max-width: 420px) {
+    .brand-name { font-size: 13px; }
+    .balance-pill { font-size: 12px; padding: 6px 10px; }
+    .panel-quote { font-size: 20px; }
+  }
+`;
+  window.DerivAnalysisApp = DerivAnalysisApp;
+})();
+</script>
+<script>
+  try {
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(window.DerivAnalysisApp));
+  } catch (err) {
+    const el = document.getElementById('error-display');
+    el.style.display = 'block';
+    el.textContent = 'RENDER ERROR: ' + err.message + '\n' + (err.stack || '');
+  }
+</script>
+</body>
+</html>
