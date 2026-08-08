@@ -273,6 +273,7 @@
     const [maxLoss, setMaxLoss] = useState(20);
     const [maxConsecutiveLosses, setMaxConsecutiveLosses] = useState(3);
     const [maxTrades, setMaxTrades] = useState(10);
+    const [confidenceThreshold, setConfidenceThreshold] = useState(0.55);
     const [sessionStats, setSessionStats] = useState({
       netPL: 0,
       consecutiveLosses: 0,
@@ -290,6 +291,7 @@
     const maxLossRef = useRef(maxLoss);
     const maxConsecutiveLossesRef = useRef(maxConsecutiveLosses);
     const maxTradesRef = useRef(maxTrades);
+    const confidenceThresholdRef = useRef(confidenceThreshold);
     const sessionStatsRef = useRef(sessionStats);
     const activeSymbolRef = useRef(activeSymbol);
     useEffect(() => {
@@ -307,6 +309,9 @@
     useEffect(() => {
       maxTradesRef.current = maxTrades;
     }, [maxTrades]);
+    useEffect(() => {
+      confidenceThresholdRef.current = confidenceThreshold;
+    }, [confidenceThreshold]);
     useEffect(() => {
       sessionStatsRef.current = sessionStats;
       if (sessionStats.stoppedReason && autoTradeRef.current) {
@@ -544,7 +549,7 @@
       if (sessionStatsRef.current.stoppedReason) return;
       const key = `${digitSignal.matchesLean}-${digitSignal.evenOddLean}-${digitSignal.overUnderLean}-${activeDigits.length}`;
       if (lastSignalRef.current[activeSymbol] === key) return;
-      if (digitSignal.overallConfidence < 0.55) return;
+      if (digitSignal.overallConfidence < confidenceThresholdRef.current) return;
       lastSignalRef.current[activeSymbol] = key;
       const options = [
         { type: digitSignal.matchesLean === "MATCHES" ? "DIGITMATCH" : "DIGITDIFF", conf: digitSignal.matchesConfidence, barrier: digitSignal.topDigit },
@@ -562,7 +567,7 @@
       if (sessionStatsRef.current.stoppedReason) return;
       const key = `${riseFallSignal.compositeLean}-${activePrices.length}`;
       if (lastSignalRef.current[activeSymbol] === key) return;
-      if (riseFallSignal.overallConfidence < 0.55) return;
+      if (riseFallSignal.overallConfidence < confidenceThresholdRef.current) return;
       lastSignalRef.current[activeSymbol] = key;
       placeAutoTrade(riseFallSignal.compositeLean === "RISE" ? "CALL" : "PUT", void 0, activeSymbol);
     }, [mode, riseFallSignal, activeSymbol, connectionState, placeAutoTrade, activePrices.length]);
@@ -664,7 +669,16 @@
         value: maxTrades,
         onChange: (e) => setMaxTrades(parseInt(e.target.value, 10) || 1)
       }
-    ))), /* @__PURE__ */ React.createElement("div", { className: "session-status" }, "Session: ", sessionStats.tradeCount, "/", maxTrades, " trades \xB7", " ", "P/L ", /* @__PURE__ */ React.createElement("span", { className: sessionStats.netPL >= 0 ? "pl-positive" : "pl-negative" }, sessionStats.netPL.toFixed(2)), " \xB7", " ", sessionStats.consecutiveLosses, " loss", sessionStats.consecutiveLosses === 1 ? "" : "es", " in a row"), sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-stopped" }, "\u26D4 Auto-trade stopped: ", sessionStats.stoppedReason, ". Toggle it back on to reset and resume."), autoTrade && !sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-note" }, "Auto-trade fires the highest-confidence sub-signal when overall confidence \u2265 55%, using the stake above, until any risk limit is hit.")), /* @__PURE__ */ React.createElement("div", { className: "log-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Trade log"), tradeLog.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "No trades yet.") : /* @__PURE__ */ React.createElement("div", { className: "log-list" }, tradeLog.map((t, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: `log-row log-${t.result.toLowerCase()}` }, /* @__PURE__ */ React.createElement("span", { className: "log-time" }, t.time), /* @__PURE__ */ React.createElement("span", { className: "log-symbol" }, t.symbol), /* @__PURE__ */ React.createElement("span", { className: "log-result" }, t.result), /* @__PURE__ */ React.createElement("span", { className: "log-detail" }, t.detail))))))));
+    ))), /* @__PURE__ */ React.createElement("div", { className: "confidence-selector" }, /* @__PURE__ */ React.createElement("span", { className: "exec-field-label" }, "Auto-trade confidence threshold"), /* @__PURE__ */ React.createElement("div", { className: "confidence-buttons" }, [0.55, 0.72, 0.82, 0.9].map((level) => /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: level,
+        className: `conf-btn ${confidenceThreshold === level ? "conf-btn-active" : ""}`,
+        onClick: () => setConfidenceThreshold(level)
+      },
+      Math.round(level * 100),
+      "%"
+    )))), /* @__PURE__ */ React.createElement("div", { className: "session-status" }, "Session: ", sessionStats.tradeCount, "/", maxTrades, " trades \xB7", " ", "P/L ", /* @__PURE__ */ React.createElement("span", { className: sessionStats.netPL >= 0 ? "pl-positive" : "pl-negative" }, sessionStats.netPL.toFixed(2)), " \xB7", " ", sessionStats.consecutiveLosses, " loss", sessionStats.consecutiveLosses === 1 ? "" : "es", " in a row"), sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-stopped" }, "\u26D4 Auto-trade stopped: ", sessionStats.stoppedReason, ". Toggle it back on to reset and resume."), autoTrade && !sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-note" }, "Auto-trade fires the highest-confidence sub-signal when overall confidence \u2265 ", Math.round(confidenceThreshold * 100), "%, using the stake above, until any risk limit is hit.")), /* @__PURE__ */ React.createElement("div", { className: "log-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Trade log"), tradeLog.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "No trades yet.") : /* @__PURE__ */ React.createElement("div", { className: "log-list" }, tradeLog.map((t, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: `log-row log-${t.result.toLowerCase()}` }, /* @__PURE__ */ React.createElement("span", { className: "log-time" }, t.time), /* @__PURE__ */ React.createElement("span", { className: "log-symbol" }, t.symbol), /* @__PURE__ */ React.createElement("span", { className: "log-result" }, t.result), /* @__PURE__ */ React.createElement("span", { className: "log-detail" }, t.detail))))))));
   }
   const styles = `
   * { box-sizing: border-box; }
@@ -854,6 +868,14 @@
     background: #0b0e12; border: 1px solid #262d38; color: #d7dbe0;
     padding: 8px 10px; border-radius: 4px; font-family: inherit; width: 110px;
   }
+  .confidence-selector { margin-top: 16px; padding-top: 16px; border-top: 1px solid #1c2128; }
+  .exec-field-label { display: block; font-size: 12px; color: #8b93a1; margin-bottom: 8px; }
+  .confidence-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+  .conf-btn {
+    background: #0b0e12; border: 1px solid #262d38; color: #8b93a1;
+    padding: 8px 16px; border-radius: 4px; font-family: inherit; font-size: 13px; cursor: pointer;
+  }
+  .conf-btn-active { border-color: #3ecf8e; color: #3ecf8e; background: #101b16; }
   .session-status { font-size: 12px; color: #8b93a1; margin-top: 14px; }
   .pl-positive { color: #3ecf8e; font-weight: 700; }
   .pl-negative { color: #e08787; font-weight: 700; }
