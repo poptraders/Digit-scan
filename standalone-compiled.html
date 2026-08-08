@@ -460,7 +460,7 @@
             currency: currency || "USD",
             duration: 1,
             duration_unit: "t",
-            symbol,
+            underlying_symbol: symbol,
             ...barrier !== void 0 ? { barrier: String(barrier) } : {}
           },
           req_id: nextReqId()
