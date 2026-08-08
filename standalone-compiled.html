@@ -678,7 +678,23 @@
       },
       Math.round(level * 100),
       "%"
-    )))), /* @__PURE__ */ React.createElement("div", { className: "session-status" }, "Session: ", sessionStats.tradeCount, "/", maxTrades, " trades \xB7", " ", "P/L ", /* @__PURE__ */ React.createElement("span", { className: sessionStats.netPL >= 0 ? "pl-positive" : "pl-negative" }, sessionStats.netPL.toFixed(2)), " \xB7", " ", sessionStats.consecutiveLosses, " loss", sessionStats.consecutiveLosses === 1 ? "" : "es", " in a row"), sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-stopped" }, "\u26D4 Auto-trade stopped: ", sessionStats.stoppedReason, ". Toggle it back on to reset and resume."), autoTrade && !sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-note" }, "Auto-trade fires the highest-confidence sub-signal when overall confidence \u2265 ", Math.round(confidenceThreshold * 100), "%, using the stake above, until any risk limit is hit.")), /* @__PURE__ */ React.createElement("div", { className: "log-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Trade log"), tradeLog.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "No trades yet.") : /* @__PURE__ */ React.createElement("div", { className: "log-list" }, tradeLog.map((t, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: `log-row log-${t.result.toLowerCase()}` }, /* @__PURE__ */ React.createElement("span", { className: "log-time" }, t.time), /* @__PURE__ */ React.createElement("span", { className: "log-symbol" }, t.symbol), /* @__PURE__ */ React.createElement("span", { className: "log-result" }, t.result), /* @__PURE__ */ React.createElement("span", { className: "log-detail" }, t.detail))))))));
+    )), /* @__PURE__ */ React.createElement("label", { className: "conf-custom" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "number",
+        min: "1",
+        max: "99",
+        step: "1",
+        className: "conf-custom-input",
+        value: Math.round(confidenceThreshold * 100),
+        onChange: (e) => {
+          const pct = parseInt(e.target.value, 10);
+          if (!Number.isNaN(pct)) {
+            setConfidenceThreshold(Math.min(99, Math.max(1, pct)) / 100);
+          }
+        }
+      }
+    ), /* @__PURE__ */ React.createElement("span", null, "%")))), /* @__PURE__ */ React.createElement("div", { className: "session-status" }, "Session: ", sessionStats.tradeCount, "/", maxTrades, " trades \xB7", " ", "P/L ", /* @__PURE__ */ React.createElement("span", { className: sessionStats.netPL >= 0 ? "pl-positive" : "pl-negative" }, sessionStats.netPL.toFixed(2)), " \xB7", " ", sessionStats.consecutiveLosses, " loss", sessionStats.consecutiveLosses === 1 ? "" : "es", " in a row"), sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-stopped" }, "\u26D4 Auto-trade stopped: ", sessionStats.stoppedReason, ". Toggle it back on to reset and resume."), autoTrade && !sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-note" }, "Auto-trade fires the highest-confidence sub-signal when overall confidence \u2265 ", Math.round(confidenceThreshold * 100), "%, using the stake above, until any risk limit is hit.")), /* @__PURE__ */ React.createElement("div", { className: "log-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Trade log"), tradeLog.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "No trades yet.") : /* @__PURE__ */ React.createElement("div", { className: "log-list" }, tradeLog.map((t, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: `log-row log-${t.result.toLowerCase()}` }, /* @__PURE__ */ React.createElement("span", { className: "log-time" }, t.time), /* @__PURE__ */ React.createElement("span", { className: "log-symbol" }, t.symbol), /* @__PURE__ */ React.createElement("span", { className: "log-result" }, t.result), /* @__PURE__ */ React.createElement("span", { className: "log-detail" }, t.detail))))))));
   }
   const styles = `
   * { box-sizing: border-box; }
@@ -876,6 +892,16 @@
     padding: 8px 16px; border-radius: 4px; font-family: inherit; font-size: 13px; cursor: pointer;
   }
   .conf-btn-active { border-color: #3ecf8e; color: #3ecf8e; background: #101b16; }
+  .conf-custom {
+    display: flex; align-items: center; gap: 6px;
+    background: #0b0e12; border: 1px solid #262d38; border-radius: 4px;
+    padding: 0 10px; color: #8b93a1; font-size: 13px;
+  }
+  .conf-custom-input {
+    background: transparent; border: none; color: #d7dbe0;
+    padding: 8px 0; font-family: inherit; font-size: 13px; width: 44px;
+  }
+  .conf-custom-input:focus { outline: none; }
   .session-status { font-size: 12px; color: #8b93a1; margin-top: 14px; }
   .pl-positive { color: #3ecf8e; font-weight: 700; }
   .pl-negative { color: #e08787; font-weight: 700; }
