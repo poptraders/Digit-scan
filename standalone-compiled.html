@@ -117,7 +117,9 @@
       if (ou === streaks.predictedOU) score += streaks.ouConfidence * 0.25;
       return score;
     });
-    const topDigit = digitScores.indexOf(Math.max(...digitScores));
+    const maxScore = Math.max(...digitScores);
+    const tiedDigits = digitScores.map((score, d) => ({ d, score })).filter(({ score }) => score === maxScore).map(({ d }) => d);
+    const topDigit = tiedDigits.length === 1 ? tiedDigits[0] : tiedDigits.reduce((best, d) => freq.counts[d] < freq.counts[best] ? d : best, tiedDigits[0]);
     const topScore = digitScores[topDigit];
     const matchesLean = matches.deviation > 0.03 ? "MATCHES" : "DIFFERS";
     const matchesConfidence = Math.min(0.9, 0.5 + Math.abs(matches.deviation) * 3);
