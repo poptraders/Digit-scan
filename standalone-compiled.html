@@ -404,7 +404,7 @@
       setErrorMsg("");
       setConnectionState("connecting");
       shouldStayConnectedRef.current = true;
-      const pws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=1089`);
+      const pws = new WebSocket(`wss://api.derivws.com/trading/v1/options/ws/public`);
       publicWsRef.current = pws;
       pws.onopen = () => {
         setErrorMsg("");
