@@ -270,6 +270,16 @@
     const [autoTrade, setAutoTrade] = useState(false);
     const [stake, setStake] = useState(1);
     const [tradeLog, setTradeLog] = useState([]);
+    const [maxLoss, setMaxLoss] = useState(20);
+    const [maxConsecutiveLosses, setMaxConsecutiveLosses] = useState(3);
+    const [maxTrades, setMaxTrades] = useState(10);
+    const [sessionStats, setSessionStats] = useState({
+      netPL: 0,
+      consecutiveLosses: 0,
+      tradeCount: 0,
+      stoppedReason: null
+      // null while running; a string once a limit trips
+    });
     const publicWsRef = useRef(null);
     const authWsRef = useRef(null);
     const reqIdRef = useRef(1);
@@ -277,6 +287,10 @@
     const autoTradeRef = useRef(autoTrade);
     const lastSignalRef = useRef({});
     const stakeRef = useRef(stake);
+    const maxLossRef = useRef(maxLoss);
+    const maxConsecutiveLossesRef = useRef(maxConsecutiveLosses);
+    const maxTradesRef = useRef(maxTrades);
+    const sessionStatsRef = useRef(sessionStats);
     const activeSymbolRef = useRef(activeSymbol);
     useEffect(() => {
       autoTradeRef.current = autoTrade;
@@ -284,6 +298,21 @@
     useEffect(() => {
       stakeRef.current = stake;
     }, [stake]);
+    useEffect(() => {
+      maxLossRef.current = maxLoss;
+    }, [maxLoss]);
+    useEffect(() => {
+      maxConsecutiveLossesRef.current = maxConsecutiveLosses;
+    }, [maxConsecutiveLosses]);
+    useEffect(() => {
+      maxTradesRef.current = maxTrades;
+    }, [maxTrades]);
+    useEffect(() => {
+      sessionStatsRef.current = sessionStats;
+      if (sessionStats.stoppedReason && autoTradeRef.current) {
+        setAutoTrade(false);
+      }
+    }, [sessionStats]);
     useEffect(() => {
       activeSymbolRef.current = activeSymbol;
     }, [activeSymbol]);
@@ -328,15 +357,29 @@
         const poc = msg.proposal_open_contract;
         if (poc.is_sold) {
           const profit = Number(poc.profit);
+          const isWin = profit >= 0;
           setTradeLog((prev) => [
             {
               time: (/* @__PURE__ */ new Date()).toLocaleTimeString(),
               symbol: poc.underlying || activeSymbolRef.current,
-              result: profit >= 0 ? "WIN" : "LOSS",
+              result: isWin ? "WIN" : "LOSS",
               detail: `Contract ${poc.contract_id} \xB7 P/L ${profit.toFixed(2)}`
             },
             ...prev
           ].slice(0, 50));
+          setSessionStats((prev) => {
+            const netPL = prev.netPL + profit;
+            const consecutiveLosses = isWin ? 0 : prev.consecutiveLosses + 1;
+            let stoppedReason = prev.stoppedReason;
+            if (!stoppedReason) {
+              if (netPL <= -maxLossRef.current) {
+                stoppedReason = `Max loss reached (session P/L ${netPL.toFixed(2)} \u2264 -${maxLossRef.current})`;
+              } else if (consecutiveLosses >= maxConsecutiveLossesRef.current) {
+                stoppedReason = `${consecutiveLosses} losses in a row (limit ${maxConsecutiveLossesRef.current})`;
+              }
+            }
+            return { ...prev, netPL, consecutiveLosses, stoppedReason };
+          });
         }
       }
       if (msg.error && msg.msg_type !== "buy") {
@@ -469,6 +512,22 @@
       },
       [sendAuth, currency]
     );
+    const placeAutoTrade = useCallback(
+      (contractType, barrier, symbol) => {
+        const stats = sessionStatsRef.current;
+        if (stats.stoppedReason) return;
+        if (stats.tradeCount >= maxTradesRef.current) {
+          setSessionStats(
+            (prev) => prev.stoppedReason ? prev : { ...prev, stoppedReason: `Max trades reached (${maxTradesRef.current})` }
+          );
+          setAutoTrade(false);
+          return;
+        }
+        setSessionStats((prev) => ({ ...prev, tradeCount: prev.tradeCount + 1 }));
+        placeTrade(contractType, barrier, symbol);
+      },
+      [placeTrade]
+    );
     const activeDigits = digitStreams[activeSymbol] || [];
     const activePrices = priceStreams[activeSymbol] || [];
     const digitSignal = mode === MODES.DIGITS ? composite(activeDigits) : null;
@@ -479,6 +538,7 @@
       if (!digitSignal) return;
       if (!autoTradeRef.current) return;
       if (connectionState !== "connected") return;
+      if (sessionStatsRef.current.stoppedReason) return;
       const key = `${digitSignal.matchesLean}-${digitSignal.evenOddLean}-${digitSignal.overUnderLean}-${activeDigits.length}`;
       if (lastSignalRef.current[activeSymbol] === key) return;
       if (digitSignal.overallConfidence < 0.55) return;
@@ -489,19 +549,20 @@
         { type: digitSignal.overUnderLean === "OVER 5" ? "DIGITOVER" : "DIGITUNDER", conf: digitSignal.ouConfidence, barrier: 5 }
       ];
       const best = options.reduce((a, b) => b.conf > a.conf ? b : a);
-      placeTrade(best.type, best.barrier, activeSymbol);
-    }, [mode, digitSignal, activeSymbol, connectionState, placeTrade, activeDigits.length]);
+      placeAutoTrade(best.type, best.barrier, activeSymbol);
+    }, [mode, digitSignal, activeSymbol, connectionState, placeAutoTrade, activeDigits.length]);
     useEffect(() => {
       if (mode !== MODES.RISE_FALL) return;
       if (!riseFallSignal) return;
       if (!autoTradeRef.current) return;
       if (connectionState !== "connected") return;
+      if (sessionStatsRef.current.stoppedReason) return;
       const key = `${riseFallSignal.compositeLean}-${activePrices.length}`;
       if (lastSignalRef.current[activeSymbol] === key) return;
       if (riseFallSignal.overallConfidence < 0.55) return;
       lastSignalRef.current[activeSymbol] = key;
-      placeTrade(riseFallSignal.compositeLean === "RISE" ? "CALL" : "PUT", void 0, activeSymbol);
-    }, [mode, riseFallSignal, activeSymbol, connectionState, placeTrade, activePrices.length]);
+      placeAutoTrade(riseFallSignal.compositeLean === "RISE" ? "CALL" : "PUT", void 0, activeSymbol);
+    }, [mode, riseFallSignal, activeSymbol, connectionState, placeAutoTrade, activePrices.length]);
     useEffect(() => {
       return () => {
         shouldStayConnectedRef.current = false;
@@ -563,11 +624,43 @@
       "button",
       {
         className: `switch ${autoTrade ? "switch-on" : ""}`,
-        onClick: () => setAutoTrade((v) => !v),
+        onClick: () => {
+          if (!autoTrade && sessionStats.stoppedReason) {
+            setSessionStats({ netPL: 0, consecutiveLosses: 0, tradeCount: 0, stoppedReason: null });
+          }
+          setAutoTrade((v) => !v);
+        },
         "aria-pressed": autoTrade
       },
       /* @__PURE__ */ React.createElement("span", { className: "switch-knob" })
-    ))), autoTrade && /* @__PURE__ */ React.createElement("p", { className: "exec-note" }, "Auto-trade fires the highest-confidence sub-signal when overall confidence \u2265 55%. No stake sizing or loss limits are applied yet \u2014 every fire uses the stake above.")), /* @__PURE__ */ React.createElement("div", { className: "log-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Trade log"), tradeLog.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "No trades yet.") : /* @__PURE__ */ React.createElement("div", { className: "log-list" }, tradeLog.map((t, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: `log-row log-${t.result.toLowerCase()}` }, /* @__PURE__ */ React.createElement("span", { className: "log-time" }, t.time), /* @__PURE__ */ React.createElement("span", { className: "log-symbol" }, t.symbol), /* @__PURE__ */ React.createElement("span", { className: "log-result" }, t.result), /* @__PURE__ */ React.createElement("span", { className: "log-detail" }, t.detail))))))));
+    ))), /* @__PURE__ */ React.createElement("div", { className: "risk-controls" }, /* @__PURE__ */ React.createElement("label", { className: "exec-field" }, "Max loss ($)", /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "number",
+        min: "0",
+        step: "1",
+        value: maxLoss,
+        onChange: (e) => setMaxLoss(parseFloat(e.target.value) || 0)
+      }
+    )), /* @__PURE__ */ React.createElement("label", { className: "exec-field" }, "Max losses in a row", /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "number",
+        min: "1",
+        step: "1",
+        value: maxConsecutiveLosses,
+        onChange: (e) => setMaxConsecutiveLosses(parseInt(e.target.value, 10) || 1)
+      }
+    )), /* @__PURE__ */ React.createElement("label", { className: "exec-field" }, "Max trades this session", /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "number",
+        min: "1",
+        step: "1",
+        value: maxTrades,
+        onChange: (e) => setMaxTrades(parseInt(e.target.value, 10) || 1)
+      }
+    ))), /* @__PURE__ */ React.createElement("div", { className: "session-status" }, "Session: ", sessionStats.tradeCount, "/", maxTrades, " trades \xB7", " ", "P/L ", /* @__PURE__ */ React.createElement("span", { className: sessionStats.netPL >= 0 ? "pl-positive" : "pl-negative" }, sessionStats.netPL.toFixed(2)), " \xB7", " ", sessionStats.consecutiveLosses, " loss", sessionStats.consecutiveLosses === 1 ? "" : "es", " in a row"), sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-stopped" }, "\u26D4 Auto-trade stopped: ", sessionStats.stoppedReason, ". Toggle it back on to reset and resume."), autoTrade && !sessionStats.stoppedReason && /* @__PURE__ */ React.createElement("p", { className: "exec-note" }, "Auto-trade fires the highest-confidence sub-signal when overall confidence \u2265 55%, using the stake above, until any risk limit is hit.")), /* @__PURE__ */ React.createElement("div", { className: "log-panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Trade log"), tradeLog.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "No trades yet.") : /* @__PURE__ */ React.createElement("div", { className: "log-list" }, tradeLog.map((t, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: `log-row log-${t.result.toLowerCase()}` }, /* @__PURE__ */ React.createElement("span", { className: "log-time" }, t.time), /* @__PURE__ */ React.createElement("span", { className: "log-symbol" }, t.symbol), /* @__PURE__ */ React.createElement("span", { className: "log-result" }, t.result), /* @__PURE__ */ React.createElement("span", { className: "log-detail" }, t.detail))))))));
   }
   const styles = `
   * { box-sizing: border-box; }
@@ -747,6 +840,15 @@
   }
   .switch-on .switch-knob { left: 20px; background: #3ecf8e; }
   .exec-note { font-size: 11.5px; color: #e0a83e; margin-top: 12px; }
+  .risk-controls { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 16px; padding-top: 16px; border-top: 1px solid #1c2128; }
+  .risk-controls input {
+    background: #0b0e12; border: 1px solid #262d38; color: #d7dbe0;
+    padding: 8px 10px; border-radius: 4px; font-family: inherit; width: 110px;
+  }
+  .session-status { font-size: 12px; color: #8b93a1; margin-top: 14px; }
+  .pl-positive { color: #3ecf8e; font-weight: 700; }
+  .pl-negative { color: #e08787; font-weight: 700; }
+  .exec-stopped { font-size: 12px; color: #e08787; margin-top: 12px; font-weight: 600; }
   .log-panel { background: #12161c; border: 1px solid #1c2128; border-radius: 6px; padding: 16px; }
   .log-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
   .log-row {
