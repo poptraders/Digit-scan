@@ -685,7 +685,7 @@
         onChange: (e) => setApiToken(e.target.value),
         className: "token-input"
       }
-    ), /* @__PURE__ */ React.createElement("button", { className: "btn btn-primary", onClick: connect, disabled: connectionState === "connecting" }, connectionState === "connecting" ? "Connecting\u2026" : "Connect")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "balance-pill" }, /* @__PURE__ */ React.createElement("span", { className: "dot dot-live" }), loginId ? `${loginId} \xB7 ` : "", balance !== null ? `${Number(balance).toFixed(2)} ${currency}` : "\u2014"), /* @__PURE__ */ React.createElement("button", { className: "btn btn-ghost", onClick: disconnect }, "Disconnect")))), errorMsg && /* @__PURE__ */ React.createElement("div", { className: "error-banner" }, errorMsg), connectionState !== "connected" ? /* @__PURE__ */ React.createElement("div", { className: "empty-state" }, /* @__PURE__ */ React.createElement("p", { className: "empty-title" }, "Not connected"), /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "Enter your registered app_id (create a PAT-type app at developers.deriv.com \u2014 the shared app_id 1089 will not work here), your account ID (e.g. DOT93836244, from home.deriv.com), and your API token (from Settings \u2192 API management \u2192 API Token), then connect. Market data streams over a public socket immediately; account calls (balance, trading) connect via a short-lived OTP fetched with your token.")) : /* @__PURE__ */ React.createElement("div", { className: "layout" }, /* @__PURE__ */ React.createElement("aside", { className: "symbol-list" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Markets"), VOLATILITY_SYMBOLS.map((s) => {
+    ), /* @__PURE__ */ React.createElement("button", { className: "btn btn-primary", onClick: connect, disabled: connectionState === "connecting" }, connectionState === "connecting" ? "Connecting\u2026" : "Connect")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "balance-pill" }, /* @__PURE__ */ React.createElement("span", { className: "dot dot-live" }), loginId ? `${loginId} \xB7 ` : "", balance !== null ? `${Number(balance).toFixed(2)} ${currency}` : "\u2014"), /* @__PURE__ */ React.createElement("button", { className: "btn btn-ghost", onClick: disconnect }, "Disconnect")))), /* @__PURE__ */ React.createElement("div", { className: "reality-check" }, /* @__PURE__ */ React.createElement("span", { className: "reality-check-icon" }, "\u26A0"), /* @__PURE__ */ React.createElement("div", { className: "reality-check-text" }, /* @__PURE__ */ React.createElement("strong", null, "Backtest result:"), " at 55% confidence, 56% win rate over 146 trades (+$81.60) \u2014 but win rate ", /* @__PURE__ */ React.createElement("em", null, "dropped"), " to 40% at 72% confidence and produced zero trades at 82%. That pattern means the 55% result is most likely noise, not real edge. Signals here have not demonstrated a reliable advantage over chance, and fixed-payout contracts carry a built-in house edge regardless. Treat this as a learning/analysis tool, not an income strategy \u2014 auto-trade with real intent to profit is not something the data supports right now.")), errorMsg && /* @__PURE__ */ React.createElement("div", { className: "error-banner" }, errorMsg), connectionState !== "connected" ? /* @__PURE__ */ React.createElement("div", { className: "empty-state" }, /* @__PURE__ */ React.createElement("p", { className: "empty-title" }, "Not connected"), /* @__PURE__ */ React.createElement("p", { className: "empty-body" }, "Enter your registered app_id (create a PAT-type app at developers.deriv.com \u2014 the shared app_id 1089 will not work here), your account ID (e.g. DOT93836244, from home.deriv.com), and your API token (from Settings \u2192 API management \u2192 API Token), then connect. Market data streams over a public socket immediately; account calls (balance, trading) connect via a short-lived OTP fetched with your token.")) : /* @__PURE__ */ React.createElement("div", { className: "layout" }, /* @__PURE__ */ React.createElement("aside", { className: "symbol-list" }, /* @__PURE__ */ React.createElement("div", { className: "panel-label" }, "Markets"), VOLATILITY_SYMBOLS.map((s) => {
       const d = digitStreams[s.code] || [];
       const t = lastTick[s.code];
       const direction = t && t.prevQuote != null ? t.quote > t.prevQuote ? "up" : t.quote < t.prevQuote ? "down" : "flat" : "flat";
@@ -852,6 +852,17 @@
     font-size: 13px;
     border-bottom: 1px solid #5c2c2c;
   }
+  .reality-check {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    background: #1a1608;
+    border-bottom: 1px solid #3a3010;
+    padding: 14px 24px;
+  }
+  .reality-check-icon { font-size: 18px; line-height: 1.3; flex-shrink: 0; }
+  .reality-check-text { font-size: 12px; color: #d4b969; line-height: 1.6; }
+  .reality-check-text strong { color: #e0a83e; }
   .empty-state { padding: 60px 24px; text-align: center; }
   .empty-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
   .empty-body { color: #5a6270; font-size: 13px; max-width: 480px; margin: 0 auto; }
@@ -1022,6 +1033,7 @@
 
   @media (max-width: 720px) {
     .topbar { padding: 12px 14px; }
+    .reality-check { padding: 12px 14px; }
     .brand-sub { display: none; }
     .conn-controls { width: 100%; }
     .token-input, .appid-input { width: 100%; min-width: 0; flex: 1 1 140px; }
