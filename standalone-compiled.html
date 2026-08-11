@@ -22,7 +22,7 @@
 </script>
 <script>
 (() => {
-  const { useState, useEffect, useRef, useCallback } = React;
+  const { useState, useEffect, useRef, useCallback, useMemo } = React;
   const VOLATILITY_SYMBOLS = [
     { code: "R_10", label: "Volatility 10 Index" },
     { code: "R_25", label: "Volatility 25 Index" },
@@ -565,6 +565,7 @@
       if (publicWsRef.current) publicWsRef.current.close();
       if (authWsRef.current) authWsRef.current.close();
       setConnectionState("disconnected");
+      setSessionStats({ netPL: 0, consecutiveLosses: 0, tradeCount: 0, stoppedReason: null });
     };
     const placeTrade = useCallback(
       (contractType, barrier, symbol) => {
@@ -605,9 +606,18 @@
     );
     const activeDigits = digitStreams[activeSymbol] || [];
     const activePrices = priceStreams[activeSymbol] || [];
-    const digitSignal = mode === MODES.DIGITS ? composite(activeDigits, ouBarrier) : null;
-    const riseFallSignal = mode === MODES.RISE_FALL ? analyzeRiseFall(activePrices) : null;
-    const accumulatorSignal = mode === MODES.ACCUMULATORS ? analyzeAccumulators(activePrices) : null;
+    const digitSignal = useMemo(
+      () => mode === MODES.DIGITS ? composite(activeDigits, ouBarrier) : null,
+      [mode, activeDigits, ouBarrier]
+    );
+    const riseFallSignal = useMemo(
+      () => mode === MODES.RISE_FALL ? analyzeRiseFall(activePrices) : null,
+      [mode, activePrices]
+    );
+    const accumulatorSignal = useMemo(
+      () => mode === MODES.ACCUMULATORS ? analyzeAccumulators(activePrices) : null,
+      [mode, activePrices]
+    );
     useEffect(() => {
       if (mode !== MODES.DIGITS) return;
       if (!digitSignal) return;
