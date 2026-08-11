@@ -443,12 +443,12 @@
             const netPL = prev.netPL + profit;
             const consecutiveLosses = isWin ? 0 : prev.consecutiveLosses + 1;
             let stoppedReason = prev.stoppedReason;
-            if (!stoppedReason) {
-              if (netPL <= -maxLossRef.current) {
-                stoppedReason = `Max loss reached (session P/L ${netPL.toFixed(2)} \u2264 -${maxLossRef.current})`;
-              } else if (consecutiveLosses >= maxConsecutiveLossesRef.current) {
-                stoppedReason = `${consecutiveLosses} losses in a row (limit ${maxConsecutiveLossesRef.current})`;
-              }
+            if (netPL <= -maxLossRef.current) {
+              stoppedReason = `Max loss reached (session P/L ${netPL.toFixed(2)} \u2264 -${maxLossRef.current})`;
+            } else if (consecutiveLosses >= maxConsecutiveLossesRef.current) {
+              stoppedReason = `${consecutiveLosses} losses in a row (limit ${maxConsecutiveLossesRef.current})`;
+            } else if (!stoppedReason) {
+              stoppedReason = null;
             }
             return { ...prev, netPL, consecutiveLosses, stoppedReason };
           });
