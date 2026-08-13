@@ -77,7 +77,9 @@ export default function DigitScanDashboard() {
     ws.onopen = () => {
       setConnected(true);
       log('Connected to market feed', 'ok');
-      subscribeTicks(symbol);
+      // Subscription is handled by the useEffect below (triggered by `connected`
+      // becoming true) — calling subscribeTicks here too caused duplicate,
+      // racing subscribe requests that Deriv rejected as invalid.
     };
 
     ws.onclose = () => {
@@ -186,8 +188,12 @@ export default function DigitScanDashboard() {
     });
   }, []);
 
+  const lastSubscribedRef = useRef(null);
+
   const subscribeTicks = useCallback((sym) => {
     if (!wsRef.current || wsRef.current.readyState !== 1) return;
+    if (lastSubscribedRef.current === sym) return; // avoid duplicate racing subscribe calls
+    lastSubscribedRef.current = sym;
     setTicks([]);
     wsRef.current.send(JSON.stringify({ forget_all: 'ticks' }));
     wsRef.current.send(JSON.stringify({ ticks: sym, subscribe: 1 }));
@@ -196,6 +202,7 @@ export default function DigitScanDashboard() {
   }, [log]);
 
   useEffect(() => {
+    lastSubscribedRef.current = null; // symbol changed — allow a fresh subscribe
     if (connected) subscribeTicks(symbol);
   }, [symbol, connected, subscribeTicks]);
 
