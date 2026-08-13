@@ -190,16 +190,24 @@ export default function DigitScanDashboard() {
 
   const lastSubscribedRef = useRef(null);
 
-  const subscribeTicks = useCallback((sym) => {
+  const subscribeTicks = useCallback(async (sym) => {
     if (!wsRef.current || wsRef.current.readyState !== 1) return;
     if (lastSubscribedRef.current === sym) return; // avoid duplicate racing subscribe calls
     lastSubscribedRef.current = sym;
     setTicks([]);
-    wsRef.current.send(JSON.stringify({ forget_all: 'ticks' }));
+    try {
+      // Wait for forget_all to actually complete before subscribing to the new
+      // symbol — firing both immediately let Deriv process them out of order,
+      // which was causing "Symbol X is invalid" even for symbols that work fine.
+      await sendRequest({ forget_all: 'ticks' });
+    } catch (e) {
+      // no active ticks subscription to forget — fine, continue
+    }
+    if (!wsRef.current || wsRef.current.readyState !== 1) return;
     wsRef.current.send(JSON.stringify({ ticks: sym, subscribe: 1 }));
     wsRef.current.send(JSON.stringify({ active_symbols: 'brief', product_type: 'basic' }));
     log(`Subscribed to ${sym}`, 'info');
-  }, [log]);
+  }, [log, sendRequest]);
 
   useEffect(() => {
     lastSubscribedRef.current = null; // symbol changed — allow a fresh subscribe
