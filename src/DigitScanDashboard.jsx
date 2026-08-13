@@ -96,7 +96,7 @@ export default function DigitScanDashboard() {
       try { data = JSON.parse(event.data); } catch { return; }
 
       if (data.error) {
-        log(`Error: ${data.error.message}`, 'error');
+        log(`Error: ${data.error.message} — for request: ${JSON.stringify(data.echo_req)}`, 'error');
         if (data.req_id && pendingRef.current[data.req_id]) {
           pendingRef.current[data.req_id].reject(data.error);
           delete pendingRef.current[data.req_id];
@@ -204,7 +204,9 @@ export default function DigitScanDashboard() {
       // no active ticks subscription to forget — fine, continue
     }
     if (!wsRef.current || wsRef.current.readyState !== 1) return;
-    wsRef.current.send(JSON.stringify({ ticks: sym, subscribe: 1 }));
+    const ticksPayload = { ticks: sym, subscribe: 1 };
+    log(`Sending: ${JSON.stringify(ticksPayload)}`, 'info');
+    wsRef.current.send(JSON.stringify(ticksPayload));
     wsRef.current.send(JSON.stringify({ active_symbols: 'brief', product_type: 'basic' }));
     log(`Subscribed to ${sym}`, 'info');
   }, [log, sendRequest]);
