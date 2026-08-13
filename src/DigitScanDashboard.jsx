@@ -43,7 +43,8 @@ function stdev(arr) {
 // ---------- Main Component ----------
 export default function DigitScanDashboard() {
   const [connected, setConnected] = useState(false);
-  const [symbol, setSymbol] = useState('R_100');
+  const [symbol, setSymbol] = useState('1HZ10V');
+  const [availableSymbols, setAvailableSymbols] = useState(SYMBOLS);
   const [pipSize, setPipSize] = useState('0.001');
   const [ticks, setTicks] = useState([]); // {quote, epoch}
   const [mode, setMode] = useState('dashboard'); // dashboard | backtest | auto | settings
@@ -118,8 +119,27 @@ export default function DigitScanDashboard() {
       }
 
       if (data.msg_type === 'active_symbols') {
-        const found = (data.active_symbols || []).find(s => s.symbol === symbol);
+        const all = data.active_symbols || [];
+        const found = all.find(s => s.symbol === symbol);
         if (found) setPipSize(String(found.pip));
+
+        // Build the real, account-valid symbol list instead of trusting a static guess.
+        // Restrict to synthetic index markets (volatility/boom/crash) since that's what
+        // digit analysis applies to.
+        const synthetic = all.filter(s =>
+          s.market === 'synthetic_index' || /^(R_|1HZ|BOOM|CRASH|JD)/.test(s.symbol)
+        );
+        if (synthetic.length) {
+          const mapped = synthetic
+            .map(s => ({ code: s.symbol, label: s.display_name || s.symbol }))
+            .sort((a, b) => a.label.localeCompare(b.label));
+          setAvailableSymbols(mapped);
+          // If the currently selected symbol isn't actually valid for this account, switch to the first valid one.
+          if (!mapped.find(m => m.code === symbol)) {
+            log(`${symbol} not available on this account — switching to ${mapped[0].label}`, 'warn');
+            setSymbol(mapped[0].code);
+          }
+        }
       }
 
       if (data.msg_type === 'authorize') {
@@ -237,6 +257,7 @@ export default function DigitScanDashboard() {
         <Sidebar
           symbol={symbol} setSymbol={setSymbol}
           logs={logs}
+          availableSymbols={availableSymbols}
         />
 
         <main style={styles.main} className="main-content">
@@ -325,13 +346,13 @@ function Header({ connected, mode, setMode, authStatus, balance, accountInfo }) 
 }
 
 // ---------- Sidebar ----------
-function Sidebar({ symbol, setSymbol, logs }) {
+function Sidebar({ symbol, setSymbol, logs, availableSymbols }) {
   return (
     <aside style={styles.sidebar}>
       <div style={styles.sidebarSection}>
         <div style={styles.sidebarLabel}>Symbol</div>
         <select value={symbol} onChange={e => setSymbol(e.target.value)} style={styles.select}>
-          {SYMBOLS.map(s => <option key={s.code} value={s.code}>{s.label}</option>)}
+          {availableSymbols.map(s => <option key={s.code} value={s.code}>{s.label}</option>)}
         </select>
       </div>
 
