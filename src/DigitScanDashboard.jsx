@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 // ---------- Constants ----------
 const APP_ID = 1089; // public Deriv app id, no auth needed for market data
-const WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
+const WS_URL = `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`; // trying alternate legacy domain — ws.derivws.com consistently rejected valid symbols like R_100
 
 const SYMBOLS = [
   { code: 'R_10', label: 'Volatility 10' },
@@ -210,11 +210,9 @@ export default function DigitScanDashboard() {
     const ticksPayload = { ticks: sym, subscribe: 1 };
     log(`Sending: ${JSON.stringify(ticksPayload)}`, 'info');
     wsRef.current.send(JSON.stringify(ticksPayload));
+    wsRef.current.send(JSON.stringify({ active_symbols: 'brief', product_type: 'basic' }));
     log(`Subscribed to ${sym}`, 'info');
     hasSubscribedOnceRef.current = true;
-    // active_symbols request temporarily removed to isolate whether it was
-    // interfering with the ticks subscribe sent right before it — will restore
-    // once we confirm the actual cause.
   }, [log, sendRequest]);
 
   useEffect(() => {
