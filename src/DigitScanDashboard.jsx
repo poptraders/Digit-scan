@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 // ---------- Constants ----------
-const APP_ID = 1089; // public Deriv app id — confirmed working for connection, just testing symbol subscription behavior
+const APP_ID = '341hdrXUHtx5petFEqVhi'; // Kevin's registered DigitScanTradingApp ID — testing whether public 1089 has symbol restrictions this doesn't
 const WS_URL = `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`;
 
 const SYMBOLS = [
