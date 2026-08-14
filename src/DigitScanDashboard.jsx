@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 // ---------- Constants ----------
-const APP_ID = 1089; // public Deriv app id, no auth needed for market data
-const WS_URL = `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`; // trying alternate legacy domain — ws.derivws.com consistently rejected valid symbols like R_100
+const APP_ID = '341hdrXUHtx5petFEqVhi'; // Kevin's registered DigitScanTradingApp ID — testing whether public 1089 has symbol restrictions this doesn't
+const WS_URL = `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`;
 
 const SYMBOLS = [
   { code: 'R_10', label: 'Volatility 10' },
