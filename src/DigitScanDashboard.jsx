@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 // ---------- Constants ----------
-const APP_ID = '341hdrXUHtx5petFEqVhi'; // Kevin's registered DigitScanTradingApp ID — testing whether public 1089 has symbol restrictions this doesn't
+const APP_ID = 1089; // public Deriv app id — confirmed working for connection, just testing symbol subscription behavior
 const WS_URL = `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`;
 
 const SYMBOLS = [
@@ -406,6 +406,27 @@ function DashboardView({ symbol, ticks, freqPct, digits, lastDigitsRecent, curre
   const lastQuote = ticks.length ? ticks[ticks.length - 1].quote : '—';
   const label = SYMBOLS.find(s => s.code === symbol)?.label || symbol;
   const expected = 10;
+  const [refDigit, setRefDigit] = useState(5);
+
+  const total = digits.length || 1;
+  const overCount = digits.filter(d => d > refDigit).length;
+  const underCount = digits.filter(d => d < refDigit).length;
+  const matchCount = digits.filter(d => d === refDigit).length;
+  const differCount = digits.filter(d => d !== refDigit).length;
+
+  // Theoretical baselines depend on the chosen reference digit —
+  // e.g. Over 5 has fewer winning digits (6,7,8,9 = 4/10 = 40%) than Over 2 (7/10 = 70%).
+  const overBaseline = ((9 - refDigit) / 10) * 100;
+  const underBaseline = (refDigit / 10) * 100;
+  const matchBaseline = 10;
+  const differBaseline = 90;
+
+  const marketStats = [
+    { label: 'Over', count: overCount, baseline: overBaseline, desc: `digit > ${refDigit}` },
+    { label: 'Under', count: underCount, baseline: underBaseline, desc: `digit < ${refDigit}` },
+    { label: 'Matches', count: matchCount, baseline: matchBaseline, desc: `digit = ${refDigit}` },
+    { label: 'Differs', count: differCount, baseline: differBaseline, desc: `digit ≠ ${refDigit}` },
+  ];
 
   return (
     <div>
@@ -446,6 +467,34 @@ function DashboardView({ symbol, ticks, freqPct, digits, lastDigitsRecent, curre
           ))}
         </div>
         <div style={styles.panelNote}>Baseline expectation is 10.0% per digit. Deviations shrink toward baseline as sample size grows — treat any single digit's edge as noise, not signal.</div>
+      </div>
+
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Over / Under / Matches / Differs</div>
+        <div style={styles.field}>
+          <label style={styles.fieldLabel}>Reference digit</label>
+          <input
+            type="number" min={0} max={9} value={refDigit}
+            onChange={e => setRefDigit(Math.max(0, Math.min(9, Number(e.target.value))))}
+            style={{ ...styles.input, maxWidth: 100, marginBottom: 16 }}
+          />
+        </div>
+        <div style={styles.statRow}>
+          {marketStats.map(m => {
+            const pct = (m.count / total) * 100;
+            const diff = pct - m.baseline;
+            return (
+              <div key={m.label} style={styles.statCard}>
+                <div style={styles.statLabel}>{m.label} <span style={{ color: '#5a5a64' }}>({m.desc})</span></div>
+                <div style={styles.statValue}>{pct.toFixed(1)}%</div>
+                <div style={{ fontSize: 11.5, marginTop: 4, color: Math.abs(diff) < 1 ? '#6a6a74' : diff > 0 ? '#3fb68a' : '#e2664a' }}>
+                  baseline {m.baseline.toFixed(1)}% ({diff >= 0 ? '+' : ''}{diff.toFixed(1)})
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={styles.panelNote}>These are observed hit-rates from live ticks, not predictions — they'll drift toward baseline as sample size grows. A market showing an edge here is not evidence it will continue; use the Backtester for a rigorous check against Deriv's actual payout structure before trusting any pattern.</div>
       </div>
 
       <div style={styles.panel}>
