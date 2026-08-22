@@ -1,8 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 // ---------- Constants ----------
-const APP_ID = 1089; // public Deriv app id — confirmed working for connection, just testing symbol subscription behavior
-const WS_URL = `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`;
+// New Options API public endpoint — message format (tick.quote, tick.epoch, tick.symbol)
+// is confirmed compatible with the legacy shape we already handle, so no message
+// parsing changes needed. Trying this since the legacy ws.derivws.com endpoint has
+// been rejecting valid symbols for this account/app despite connecting successfully.
+const WS_URL = `wss://api.derivws.com/trading/v1/options/ws/public`;
+
+// New Options API — account-bound calls (balance, buy, portfolio) require a
+// separate OTP-authenticated WebSocket, obtained via a REST call using your
+// registered app's ID and a Bearer token. See AccountAuth logic below.
+const OTP_REST_BASE = 'https://api.derivws.com/trading/v1/options/accounts';
 
 const SYMBOLS = [
   { code: 'R_10', label: 'Volatility 10' },
@@ -67,6 +75,8 @@ export default function DigitScanDashboard() {
   const [ticks, setTicks] = useState([]); // {quote, epoch}
   const [mode, setMode] = useState('dashboard'); // dashboard | backtest | auto | settings
   const [token, setToken] = useState('');
+  const [accountId, setAccountId] = useState(''); // Deriv login ID, e.g. "CR123456" or "DOT93836244" — required for the OTP endpoint
+  const [otpAppId, setOtpAppId] = useState('341hdrXUHtx5petFEqVhi'); // DigitScanTradingApp's registered App ID (new-API style, different from the legacy numeric app_id)
   const [rememberToken, setRememberToken] = useState(false);
   const [authStatus, setAuthStatus] = useState('idle'); // idle | authing | ok | error
   const [balance, setBalance] = useState(null);
@@ -75,6 +85,7 @@ export default function DigitScanDashboard() {
   const [reqCounter, setReqCounter] = useState(1);
 
   const wsRef = useRef(null);
+  const tradeWsRef = useRef(null); // separate, OTP-authenticated socket for balance/buy/portfolio
   const pendingRef = useRef({}); // req_id -> resolver
   const historyReqSymbol = useRef(null);
 
@@ -188,7 +199,7 @@ export default function DigitScanDashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const sendRequest = useCallback((payload) => {
+  const sendRequest = useCallback((payload, timeoutMs = 15000) => {
     return new Promise((resolve, reject) => {
       if (!wsRef.current || wsRef.current.readyState !== 1) {
         reject(new Error('Not connected'));
@@ -202,7 +213,28 @@ export default function DigitScanDashboard() {
           pendingRef.current[req_id].reject(new Error('Timeout'));
           delete pendingRef.current[req_id];
         }
-      }, 15000);
+      }, timeoutMs);
+    });
+  }, []);
+
+  // Account-bound calls (proposal, buy, portfolio) must go over the separate
+  // OTP-authenticated trade socket, not the public market-data one — shares the
+  // same pendingRef map since req_ids are unique across both sockets.
+  const sendTradeRequest = useCallback((payload, timeoutMs = 15000) => {
+    return new Promise((resolve, reject) => {
+      if (!tradeWsRef.current || tradeWsRef.current.readyState !== 1) {
+        reject(new Error('Not authorized — connect an account in the Account tab first'));
+        return;
+      }
+      const req_id = Date.now() + Math.floor(Math.random() * 1000);
+      pendingRef.current[req_id] = { resolve, reject };
+      tradeWsRef.current.send(JSON.stringify({ ...payload, req_id }));
+      setTimeout(() => {
+        if (pendingRef.current[req_id]) {
+          pendingRef.current[req_id].reject(new Error('Timeout'));
+          delete pendingRef.current[req_id];
+        }
+      }, timeoutMs);
     });
   }, []);
 
@@ -239,23 +271,79 @@ export default function DigitScanDashboard() {
   }, [symbol, connected, subscribeTicks]);
 
   // ---------- Auth ----------
+  // Modern Deriv API: account-bound calls (balance, buy, portfolio) require a
+  // one-time-password fetched via REST, then a fresh WebSocket connected to the
+  // URL that OTP response returns — not the old authorize-message flow, which
+  // Deriv support confirmed does not work with current Personal Access Tokens.
   const handleAuthorize = async () => {
     if (!token.trim()) { log('Enter a token first', 'warn'); return; }
+    if (!accountId.trim()) { log('Enter your Deriv account/login ID first (e.g. CR123456)', 'warn'); return; }
     setAuthStatus('authing');
     try {
-      const res = await sendRequest({ authorize: token.trim() });
-      if (res.authorize) {
-        setAuthStatus('ok');
-        setAccountInfo(res.authorize);
-        setBalance(res.authorize.balance);
-        log(`Authorized: ${res.authorize.loginid} (${res.authorize.is_virtual ? 'DEMO' : 'REAL'})`, 'ok');
-        if (!res.authorize.is_virtual) {
-          log('WARNING: this token is on a REAL account, not demo', 'error');
-        }
+      const otpRes = await fetch(`${OTP_REST_BASE}/${encodeURIComponent(accountId.trim())}/otp`, {
+        method: 'POST',
+        headers: {
+          'Deriv-App-ID': otpAppId.trim(),
+          'Authorization': `Bearer ${token.trim()}`,
+        },
+      });
+      const otpJson = await otpRes.json();
+      if (!otpRes.ok || !otpJson?.data?.url) {
+        const msg = otpJson?.errors?.[0]?.message || `HTTP ${otpRes.status}`;
+        throw new Error(msg);
       }
+
+      const tradeUrl = otpJson.data.url;
+      const isDemo = tradeUrl.includes('/ws/demo');
+      log(`OTP received — connecting to ${isDemo ? 'demo' : 'real'} trading socket…`, 'info');
+
+      const tradeWs = new WebSocket(tradeUrl);
+      tradeWsRef.current = tradeWs;
+
+      tradeWs.onopen = () => {
+        setAuthStatus('ok');
+        const info = { loginid: accountId.trim(), is_virtual: isDemo, currency: 'USD' };
+        setAccountInfo(info);
+        log(`Authorized: ${info.loginid} (${isDemo ? 'DEMO' : 'REAL'})`, 'ok');
+        if (!isDemo) log('WARNING: this is a REAL account, not demo', 'error');
+        tradeWs.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+      };
+
+      tradeWs.onmessage = (event) => {
+        let data;
+        try { data = JSON.parse(event.data); } catch { return; }
+        if (data.error) {
+          log(`Trade socket error: ${data.error.message}`, 'error');
+          if (data.req_id && pendingRef.current[data.req_id]) {
+            pendingRef.current[data.req_id].reject(data.error);
+            delete pendingRef.current[data.req_id];
+          }
+          return;
+        }
+        if (data.req_id && pendingRef.current[data.req_id]) {
+          pendingRef.current[data.req_id].resolve(data);
+          delete pendingRef.current[data.req_id];
+        }
+        if (data.msg_type === 'balance' && data.balance) {
+          setBalance(data.balance.balance);
+          setAccountInfo(prev => prev ? { ...prev, currency: data.balance.currency || prev.currency } : prev);
+        }
+        if (data.msg_type === 'buy' && data.buy) {
+          log(`Trade placed: contract ${data.buy.contract_id}, buy price ${data.buy.buy_price}`, 'ok');
+        }
+      };
+
+      tradeWs.onerror = () => log('Trade socket connection error', 'error');
+      tradeWs.onclose = () => {
+        log('Trade socket disconnected', 'warn');
+        if (tradeWsRef.current === tradeWs) {
+          setAuthStatus('idle');
+          tradeWsRef.current = null;
+        }
+      };
     } catch (e) {
       setAuthStatus('error');
-      log(`Authorization failed: ${e.message || e.error?.message || 'unknown error'}`, 'error');
+      log(`Authorization failed: ${e.message || 'unknown error'}`, 'error');
     }
   };
 
@@ -264,6 +352,10 @@ export default function DigitScanDashboard() {
     setAuthStatus('idle');
     setAccountInfo(null);
     setBalance(null);
+    if (tradeWsRef.current) {
+      tradeWsRef.current.close();
+      tradeWsRef.current = null;
+    }
     log('Token cleared from session', 'info');
   };
 
@@ -326,7 +418,7 @@ export default function DigitScanDashboard() {
             <AutoTraderView
               symbol={symbol}
               authStatus={authStatus}
-              sendRequest={sendRequest}
+              sendTradeRequest={sendTradeRequest}
               digits={digits}
               log={log}
               balance={balance}
@@ -335,6 +427,8 @@ export default function DigitScanDashboard() {
           {mode === 'settings' && (
             <SettingsView
               token={token} setToken={setToken}
+              accountId={accountId} setAccountId={setAccountId}
+              otpAppId={otpAppId} setOtpAppId={setOtpAppId}
               rememberToken={rememberToken} setRememberToken={setRememberToken}
               authStatus={authStatus}
               accountInfo={accountInfo}
@@ -566,26 +660,32 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
     if (!connected) { log('Not connected to feed', 'warn'); return; }
     setRunning(true);
     setResult(null);
+    let allPrices = [];
+    let batchNum = 0;
     try {
       const targetCount = Math.max(100, Number(count) || 1000);
       const batchSize = 5000; // Deriv's practical per-request cap for ticks_history
       const maxBatches = 20; // safety cap — up to 100,000 ticks, plenty for any realistic sample
-      let allPrices = [];
       let earliestEpoch = null;
-      let batchNum = 0;
 
       while (allPrices.length < targetCount && batchNum < maxBatches) {
         const remaining = targetCount - allPrices.length;
+        const isFirstBatch = earliestEpoch === null;
         const req = {
           ticks_history: symbol,
-          adjust_start_time: 1,
           count: Math.min(batchSize, remaining),
-          start: 1,
           style: 'ticks',
+          end: isFirstBatch ? 'latest' : String(earliestEpoch - 1),
         };
-        req.end = earliestEpoch === null ? 'latest' : String(earliestEpoch - 1);
+        if (isFirstBatch) {
+          // start/adjust_start_time are only meaningful when anchored to 'latest' —
+          // including them on historical (specific end-epoch) batches was likely
+          // confusing Deriv's server and causing the request to hang/timeout.
+          req.adjust_start_time = 1;
+          req.start = 1;
+        }
 
-        const res = await sendRequest(req);
+        const res = await sendRequest(req, 30000); // large historical fetches need more than the default 15s
         const batchPrices = res.history?.prices || [];
         const batchTimes = res.history?.times || [];
         if (!batchPrices.length) break; // no more history available this far back
@@ -679,7 +779,7 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
       });
       log(`Backtest complete: ${wins + losses} trades (${skipped} skipped by filter), ${winRate.toFixed(1)}% win rate, net P/L ${bank.toFixed(2)}`, bank >= 0 ? 'ok' : 'warn');
     } catch (e) {
-      log(`Backtest failed: ${e.message || 'unknown error'}`, 'error');
+      log(`Backtest failed: ${e.message || 'unknown error'} (batch ${batchNum + 1}, ${allPrices.length} ticks fetched so far)`, 'error');
     }
     setRunning(false);
   };
@@ -819,7 +919,7 @@ function EquityChart({ curve }) {
 }
 
 // ---------- Auto-Trader View ----------
-function AutoTraderView({ symbol, authStatus, sendRequest, digits, log, balance }) {
+function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, balance }) {
   const [enabled, setEnabled] = useState(false);
   const [predDigit, setPredDigit] = useState(5);
   const [direction, setDirection] = useState('over');
@@ -837,7 +937,7 @@ function AutoTraderView({ symbol, authStatus, sendRequest, digits, log, balance 
   const placeTrade = async () => {
     if (!isDemo) { log('Authorize an account first (Account tab)', 'warn'); return; }
     try {
-      const proposal = await sendRequest({
+      const proposal = await sendTradeRequest({
         proposal: 1,
         amount: Number(stake),
         basis: 'stake',
@@ -849,7 +949,7 @@ function AutoTraderView({ symbol, authStatus, sendRequest, digits, log, balance 
         barrier: String(predDigit),
       });
       if (proposal.proposal) {
-        const buy = await sendRequest({ buy: proposal.proposal.id, price: proposal.proposal.ask_price });
+        const buy = await sendTradeRequest({ buy: proposal.proposal.id, price: proposal.proposal.ask_price });
         if (buy.buy) {
           setTradesPlaced(n => n + 1);
         }
@@ -927,7 +1027,7 @@ function AutoTraderView({ symbol, authStatus, sendRequest, digits, log, balance 
 }
 
 // ---------- Settings View ----------
-function SettingsView({ token, setToken, rememberToken, setRememberToken, authStatus, accountInfo, balance, onAuthorize, onForget }) {
+function SettingsView({ token, setToken, accountId, setAccountId, otpAppId, setOtpAppId, rememberToken, setRememberToken, authStatus, accountInfo, balance, onAuthorize, onForget }) {
   return (
     <div>
       <div style={styles.viewHeader}>
@@ -938,12 +1038,29 @@ function SettingsView({ token, setToken, rememberToken, setRememberToken, authSt
       </div>
 
       <div style={styles.panel}>
+        <Field label="Account / login ID">
+          <input
+            type="text"
+            value={accountId}
+            onChange={e => setAccountId(e.target.value)}
+            placeholder="e.g. CR123456 or your demo login ID"
+            style={styles.input}
+          />
+        </Field>
         <Field label="API token">
           <input
             type="password"
             value={token}
             onChange={e => setToken(e.target.value)}
             placeholder="Paste your DigitScanTradingApp token"
+            style={styles.input}
+          />
+        </Field>
+        <Field label="App ID">
+          <input
+            type="text"
+            value={otpAppId}
+            onChange={e => setOtpAppId(e.target.value)}
             style={styles.input}
           />
         </Field>
@@ -966,7 +1083,6 @@ function SettingsView({ token, setToken, rememberToken, setRememberToken, authSt
             </div>
             <div style={styles.acctRow}><span>Login ID</span><span>{accountInfo.loginid}</span></div>
             <div style={styles.acctRow}><span>Balance</span><span>{balance} {accountInfo.currency}</span></div>
-            <div style={styles.acctRow}><span>Scopes</span><span>{(accountInfo.scopes || []).join(', ')}</span></div>
           </div>
         )}
 
