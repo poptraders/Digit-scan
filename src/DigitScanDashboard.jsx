@@ -567,15 +567,40 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
     setRunning(true);
     setResult(null);
     try {
-      const res = await sendRequest({
-        ticks_history: symbol,
-        adjust_start_time: 1,
-        count: Math.min(count, 5000),
-        end: 'latest',
-        start: 1,
-        style: 'ticks',
-      });
-      const prices = res.history?.prices || [];
+      const targetCount = Math.max(100, Number(count) || 1000);
+      const batchSize = 5000; // Deriv's practical per-request cap for ticks_history
+      const maxBatches = 20; // safety cap — up to 100,000 ticks, plenty for any realistic sample
+      let allPrices = [];
+      let earliestEpoch = null;
+      let batchNum = 0;
+
+      while (allPrices.length < targetCount && batchNum < maxBatches) {
+        const remaining = targetCount - allPrices.length;
+        const req = {
+          ticks_history: symbol,
+          adjust_start_time: 1,
+          count: Math.min(batchSize, remaining),
+          start: 1,
+          style: 'ticks',
+        };
+        req.end = earliestEpoch === null ? 'latest' : String(earliestEpoch - 1);
+
+        const res = await sendRequest(req);
+        const batchPrices = res.history?.prices || [];
+        const batchTimes = res.history?.times || [];
+        if (!batchPrices.length) break; // no more history available this far back
+
+        allPrices = [...batchPrices, ...allPrices]; // older batch goes at the front
+        if (batchTimes.length) {
+          earliestEpoch = batchTimes[0];
+        } else {
+          break; // can't page further back without timestamps
+        }
+        batchNum++;
+        log(`Fetched ${allPrices.length} / ${targetCount} ticks so far…`, 'info');
+      }
+
+      const prices = allPrices.slice(-targetCount); // trim to exactly the requested count if we overshot
       if (!prices.length) { log('No history returned', 'error'); setRunning(false); return; }
 
       const decimals = inferDecimals(prices);
@@ -659,7 +684,7 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
       <div style={styles.panel}>
         <div style={styles.formGrid}>
           <Field label="History sample (ticks)">
-            <input type="number" min={100} max={5000} value={count} onChange={e => setCount(Number(e.target.value))} style={styles.input} />
+            <input type="number" min={100} max={100000} value={count} onChange={e => setCount(Number(e.target.value))} style={styles.input} />
           </Field>
           <Field label="Prediction type">
             <select value={direction} onChange={e => setDirection(e.target.value)} style={styles.select}>
