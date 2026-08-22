@@ -530,6 +530,12 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
   const [martingaleMult, setMartingaleMult] = useState(2);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null);
+  const [useEntryFilter, setUseEntryFilter] = useState(false);
+  const [filterWindow, setFilterWindow] = useState(100);
+  const [filterDigits, setFilterDigits] = useState('8,9');
+  const [filterThreshold, setFilterThreshold] = useState(10);
+  const [filterDigit7, setFilterDigit7] = useState(true);
+  const [filterThreshold7, setFilterThreshold7] = useState(10.5);
 
   const runBacktest = async () => {
     if (!connected) { log('Not connected to feed', 'warn'); return; }
@@ -553,10 +559,31 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
       let bank = 0;
       let currentStake = Number(stake);
       let wins = 0, losses = 0;
+      let skipped = 0;
       let peak = 0, trough = 0, maxDrawdown = 0;
       const equityCurve = [];
 
-      digitSeq.forEach((d) => {
+      const filterDigitList = filterDigits.split(',').map(s => Number(s.trim())).filter(n => !isNaN(n));
+
+      // Check whether a rolling window ending at index i meets the entry filter —
+      // e.g. digits 8 & 9 each below 10% frequency, digit 7 below 10.5%, over the
+      // last `filterWindow` ticks. Mirrors the manual "wait for the setup" rule
+      // exactly as described, rather than trading on every tick.
+      const passesFilter = (i) => {
+        if (!useEntryFilter) return true;
+        if (i < filterWindow) return false; // not enough history yet for a real window
+        const windowSlice = digitSeq.slice(i - filterWindow, i);
+        const freq = new Array(10).fill(0);
+        windowSlice.forEach(d => freq[d]++);
+        const pct = freq.map(f => (f / filterWindow) * 100);
+        const otherDigitsOk = filterDigitList.every(d => pct[d] < filterThreshold);
+        const digit7Ok = !filterDigit7 || pct[7] < filterThreshold7;
+        return otherDigitsOk && digit7Ok;
+      };
+
+      digitSeq.forEach((d, i) => {
+        if (!passesFilter(i)) { skipped++; return; } // no trade this tick — condition not met
+
         let win;
         if (direction === 'over') win = d > predDigit;
         else if (direction === 'under') win = d < predDigit;
@@ -578,17 +605,17 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
         maxDrawdown = Math.min(maxDrawdown, bank - peak);
       });
 
-      const winRate = (wins / (wins + losses)) * 100;
+      const winRate = (wins + losses) > 0 ? (wins / (wins + losses)) * 100 : 0;
       setResult({
         trades: wins + losses,
-        wins, losses,
+        wins, losses, skipped,
         winRate,
         netPL: bank,
         maxDrawdown,
         equityCurve,
         finalStake: currentStake,
       });
-      log(`Backtest complete: ${wins + losses} trades, ${winRate.toFixed(1)}% win rate, net P/L ${bank.toFixed(2)}`, bank >= 0 ? 'ok' : 'warn');
+      log(`Backtest complete: ${wins + losses} trades (${skipped} skipped by filter), ${winRate.toFixed(1)}% win rate, net P/L ${bank.toFixed(2)}`, bank >= 0 ? 'ok' : 'warn');
     } catch (e) {
       log(`Backtest failed: ${e.message || 'unknown error'}`, 'error');
     }
@@ -638,6 +665,37 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
             </Field>
           )}
         </div>
+
+        <label style={styles.checkboxRow}>
+          <input type="checkbox" checked={useEntryFilter} onChange={e => setUseEntryFilter(e.target.checked)} />
+          Only trade when a frequency "setup" condition is met (rather than every tick)
+        </label>
+
+        {useEntryFilter && (
+          <div style={{ ...styles.formGrid, marginTop: 4 }}>
+            <Field label="Lookback window (ticks)">
+              <input type="number" min={10} max={1000} value={filterWindow} onChange={e => setFilterWindow(Number(e.target.value))} style={styles.input} />
+            </Field>
+            <Field label="Digits that must be below threshold">
+              <input type="text" value={filterDigits} onChange={e => setFilterDigits(e.target.value)} placeholder="e.g. 8,9" style={styles.input} />
+            </Field>
+            <Field label="Threshold % for those digits">
+              <input type="number" min={0} max={100} step={0.1} value={filterThreshold} onChange={e => setFilterThreshold(Number(e.target.value))} style={styles.input} />
+            </Field>
+            <Field label="Also require digit 7 below threshold">
+              <select value={filterDigit7 ? 'yes' : 'no'} onChange={e => setFilterDigit7(e.target.value === 'yes')} style={styles.select}>
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </Field>
+            {filterDigit7 && (
+              <Field label="Digit 7 threshold %">
+                <input type="number" min={0} max={100} step={0.1} value={filterThreshold7} onChange={e => setFilterThreshold7(Number(e.target.value))} style={styles.input} />
+              </Field>
+            )}
+          </div>
+        )}
+
         <button onClick={runBacktest} disabled={running} style={styles.primaryBtn}>
           {running ? 'Running…' : 'Run backtest'}
         </button>
@@ -652,6 +710,7 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
             <StatCard label="Win rate" value={`${result.winRate.toFixed(1)}%`} />
             <StatCard label="Net P/L" value={result.netPL.toFixed(2)} />
             <StatCard label="Max drawdown" value={result.maxDrawdown.toFixed(2)} />
+            {result.skipped > 0 && <StatCard label="Skipped (no setup)" value={result.skipped} />}
           </div>
           <EquityChart curve={result.equityCurve} />
           <div style={{ ...styles.panelNote, color: result.netPL >= 0 ? '#3fb68a' : '#e2664a' }}>
