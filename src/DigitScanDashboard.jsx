@@ -33,6 +33,24 @@ function lastDigit(quote, pip) {
   return Number(str[str.length - 1]);
 }
 
+// Determines the real decimal precision directly from a batch of price values,
+// instead of trusting a separately-fetched `pipSize` that can arrive after a
+// backtest has already run and silently corrupt every digit extraction with
+// the wrong precision. Uses the max decimal length seen across the sample,
+// since some individual prices may have trailing zeros stripped by JSON.
+function inferDecimals(prices) {
+  let maxDecimals = 0;
+  for (const p of prices) {
+    const str = String(p);
+    const dot = str.indexOf('.');
+    if (dot !== -1) {
+      const len = str.length - dot - 1;
+      if (len > maxDecimals) maxDecimals = len;
+    }
+  }
+  return maxDecimals || 2; // sensible fallback if every sampled price happened to be a whole number
+}
+
 function mean(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0; }
 function stdev(arr) {
   if (arr.length < 2) return 0;
@@ -250,7 +268,14 @@ export default function DigitScanDashboard() {
   };
 
   // ---------- Digit analysis ----------
-  const digits = ticks.map(t => lastDigit(t.quote, pipSize));
+  // Infer decimal precision from the live tick buffer itself rather than the
+  // separately-fetched pipSize, which can arrive after ticks have already
+  // started streaming and silently corrupt digit extraction until it resolves.
+  const liveDecimals = ticks.length ? inferDecimals(ticks.map(t => t.quote)) : ((pipSize.split('.')[1] || '').length || 2);
+  const digits = ticks.map(t => {
+    const str = Number(t.quote).toFixed(liveDecimals);
+    return Number(str[str.length - 1]);
+  });
   const freq = new Array(10).fill(0);
   digits.forEach(d => freq[d]++);
   const total = digits.length || 1;
@@ -553,7 +578,7 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
       const prices = res.history?.prices || [];
       if (!prices.length) { log('No history returned', 'error'); setRunning(false); return; }
 
-      const decimals = (pipSize.split('.')[1] || '').length;
+      const decimals = inferDecimals(prices);
       const digitSeq = prices.map(p => Number(Number(p).toFixed(decimals).slice(-1)));
 
       let bank = 0;
@@ -645,7 +670,7 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
             </select>
           </Field>
           <Field label="Digit">
-            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Number(e.target.value))} style={styles.input} />
+            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={styles.input} />
           </Field>
           <Field label="Stake (per trade)">
             <input type="number" min={0.5} step={0.5} value={stake} onChange={e => setStake(Number(e.target.value))} style={styles.input} />
@@ -824,7 +849,7 @@ function AutoTraderView({ symbol, authStatus, sendRequest, digits, log, balance 
             </select>
           </Field>
           <Field label="Digit">
-            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Number(e.target.value))} style={styles.input} />
+            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={styles.input} />
           </Field>
           <Field label="Stake">
             <input type="number" min={0.5} step={0.5} value={stake} onChange={e => setStake(Number(e.target.value))} style={styles.input} />
