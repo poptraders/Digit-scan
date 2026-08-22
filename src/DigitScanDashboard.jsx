@@ -532,6 +532,8 @@ function DashboardView({ symbol, ticks, freqPct, digits, lastDigitsRecent, curre
   const underCount = digits.filter(d => d < refDigit).length;
   const matchCount = digits.filter(d => d === refDigit).length;
   const differCount = digits.filter(d => d !== refDigit).length;
+  const oddCount = digits.filter(d => d % 2 === 1).length;
+  const evenCount = digits.filter(d => d % 2 === 0).length;
 
   // Theoretical baselines depend on the chosen reference digit —
   // e.g. Over 5 has fewer winning digits (6,7,8,9 = 4/10 = 40%) than Over 2 (7/10 = 70%).
@@ -539,12 +541,15 @@ function DashboardView({ symbol, ticks, freqPct, digits, lastDigitsRecent, curre
   const underBaseline = (refDigit / 10) * 100;
   const matchBaseline = 10;
   const differBaseline = 90;
+  const oddEvenBaseline = 50; // 5 odd digits, 5 even digits — always a flat 50/50 baseline
 
   const marketStats = [
     { label: 'Over', count: overCount, baseline: overBaseline, desc: `digit > ${refDigit}` },
     { label: 'Under', count: underCount, baseline: underBaseline, desc: `digit < ${refDigit}` },
     { label: 'Matches', count: matchCount, baseline: matchBaseline, desc: `digit = ${refDigit}` },
     { label: 'Differs', count: differCount, baseline: differBaseline, desc: `digit ≠ ${refDigit}` },
+    { label: 'Odd', count: oddCount, baseline: oddEvenBaseline, desc: `1,3,5,7,9` },
+    { label: 'Even', count: evenCount, baseline: oddEvenBaseline, desc: `0,2,4,6,8` },
   ];
 
   return (
@@ -589,7 +594,7 @@ function DashboardView({ symbol, ticks, freqPct, digits, lastDigitsRecent, curre
       </div>
 
       <div style={styles.panel}>
-        <div style={styles.panelTitle}>Over / Under / Matches / Differs</div>
+        <div style={styles.panelTitle}>Over / Under / Matches / Differs / Odd / Even</div>
         <div style={styles.field}>
           <label style={styles.fieldLabel}>Reference digit</label>
           <input
@@ -742,7 +747,9 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
         if (direction === 'over') win = d > predDigit;
         else if (direction === 'under') win = d < predDigit;
         else if (direction === 'match') win = d === predDigit;
-        else win = d !== predDigit;
+        else if (direction === 'differ') win = d !== predDigit;
+        else if (direction === 'odd') win = d % 2 === 1;
+        else win = d % 2 === 0; // even
 
         if (win) {
           bank += currentStake * (payoutPct / 100);
@@ -804,10 +811,12 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
               <option value="under">Under</option>
               <option value="match">Matches</option>
               <option value="differ">Differs</option>
+              <option value="odd">Odd</option>
+              <option value="even">Even</option>
             </select>
           </Field>
           <Field label="Digit">
-            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={styles.input} />
+            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={styles.input} disabled={direction === 'odd' || direction === 'even'} />
           </Field>
           <Field label="Stake (per trade)">
             <input type="number" min={0.5} step={0.5} value={stake} onChange={e => setStake(Number(e.target.value))} style={styles.input} />
@@ -932,11 +941,13 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, bal
 
   const contractType = {
     over: 'DIGITOVER', under: 'DIGITUNDER', match: 'DIGITMATCH', differ: 'DIGITDIFF',
+    odd: 'DIGITODD', even: 'DIGITEVEN',
   }[direction];
 
   const placeTrade = async () => {
     if (!isDemo) { log('Authorize an account first (Account tab)', 'warn'); return; }
     try {
+      const needsBarrier = direction !== 'odd' && direction !== 'even';
       const proposal = await sendTradeRequest({
         proposal: 1,
         amount: Number(stake),
@@ -946,7 +957,7 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, bal
         duration: 1,
         duration_unit: 't',
         symbol,
-        barrier: String(predDigit),
+        ...(needsBarrier ? { barrier: String(predDigit) } : {}),
       });
       if (proposal.proposal) {
         const buy = await sendTradeRequest({ buy: proposal.proposal.id, price: proposal.proposal.ask_price });
@@ -992,10 +1003,12 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, bal
               <option value="under">Under</option>
               <option value="match">Matches</option>
               <option value="differ">Differs</option>
+              <option value="odd">Odd</option>
+              <option value="even">Even</option>
             </select>
           </Field>
           <Field label="Digit">
-            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={styles.input} />
+            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={styles.input} disabled={direction === 'odd' || direction === 'even'} />
           </Field>
           <Field label="Stake">
             <input type="number" min={0.5} step={0.5} value={stake} onChange={e => setStake(Number(e.target.value))} style={styles.input} />
