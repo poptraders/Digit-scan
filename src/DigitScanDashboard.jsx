@@ -613,6 +613,10 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
       let peak = 0, trough = 0, maxDrawdown = 0;
       const equityCurve = [];
 
+      let currentLossStreak = 0;
+      let longestLossStreak = 0;
+      let peakStakeRequired = Number(stake);
+
       const filterDigitList = filterDigits.split(',').map(s => Number(s.trim())).filter(n => !isNaN(n));
 
       // Check whether a rolling window ending at index i meets the entry filter —
@@ -643,11 +647,17 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
         if (win) {
           bank += currentStake * (payoutPct / 100);
           wins++;
+          currentLossStreak = 0;
           if (staking === 'martingale') currentStake = Number(stake);
         } else {
           bank -= currentStake;
           losses++;
-          if (staking === 'martingale') currentStake *= Number(martingaleMult);
+          currentLossStreak++;
+          longestLossStreak = Math.max(longestLossStreak, currentLossStreak);
+          if (staking === 'martingale') {
+            currentStake *= Number(martingaleMult);
+            peakStakeRequired = Math.max(peakStakeRequired, currentStake);
+          }
         }
         equityCurve.push(bank);
         peak = Math.max(peak, bank);
@@ -658,6 +668,8 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
       const winRate = (wins + losses) > 0 ? (wins / (wins + losses)) * 100 : 0;
       setResult({
         trades: wins + losses,
+        longestLossStreak,
+        peakStakeRequired,
         wins, losses, skipped,
         winRate,
         netPL: bank,
@@ -761,6 +773,10 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
             <StatCard label="Net P/L" value={result.netPL.toFixed(2)} />
             <StatCard label="Max drawdown" value={result.maxDrawdown.toFixed(2)} />
             {result.skipped > 0 && <StatCard label="Skipped (no setup)" value={result.skipped} />}
+            <StatCard label="Longest losing streak" value={result.longestLossStreak} />
+            {staking === 'martingale' && (
+              <StatCard label="Peak stake required" value={result.peakStakeRequired.toFixed(2)} />
+            )}
           </div>
           <EquityChart curve={result.equityCurve} />
           <div style={{ ...styles.panelNote, color: result.netPL >= 0 ? '#3fb68a' : '#e2664a' }}>
@@ -768,6 +784,11 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
               ? 'Positive over this sample — verify across more symbols and longer windows before trusting it; short samples can look profitable by chance.'
               : 'Negative over this sample — this rule set loses money at the assumed payout. Adjust the rule or accept it is not viable as-is.'}
           </div>
+          {staking === 'martingale' && (
+            <div style={{ ...styles.panelNote, color: '#e8b04b' }}>
+              A net-positive martingale result does not mean the underlying bet has a real edge — martingale cannot turn a losing bet into a winning one. It only redistributes risk into rarer, larger losses. The longest losing streak in this specific sample required a stake of {result.peakStakeRequired.toFixed(2)}, starting from {Number(stake).toFixed(2)} — a longer streak (which becomes likely the more you trade) would require proportionally more, and can exceed what any account or table limit allows.
+            </div>
+          )}
         </div>
       )}
     </div>
