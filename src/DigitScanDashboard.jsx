@@ -1153,7 +1153,7 @@ const styles = {
   logTime: { color: '#5a5a64' },
   logEmpty: { fontSize: 13, color: '#5a5a64' },
 
-  main: { flex: 1, padding: '28px 20px', minWidth: 0, maxWidth: 900, margin: '0 auto', boxSizing: 'border-box' },
+  main: { flex: 1, padding: '28px 20px', minWidth: 0, maxWidth: 900, width: '100%', margin: '0 auto', boxSizing: 'border-box' },
   viewHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 28, flexWrap: 'wrap', gap: 16 },
   viewTitle: { fontSize: 24, fontWeight: 700 },
   viewSub: { fontSize: 14, color: '#8f8f99', marginTop: 6, lineHeight: 1.5 },
@@ -1161,16 +1161,16 @@ const styles = {
   priceLabel: { fontSize: 12, color: '#6a6a74', textTransform: 'uppercase', letterSpacing: 0.5 },
   priceValue: { fontFamily: FONT_MONO, fontSize: 26, fontWeight: 700, color: '#3fb68a', marginTop: 4 },
 
-  statRow: { display: 'flex', gap: 14, marginBottom: 24, flexWrap: 'wrap' },
-  statCard: { background: '#161619', border: '1px solid #232329', borderRadius: 10, padding: '16px 18px', flex: '1 1 160px', minWidth: 160 },
+  statRow: { display: 'flex', gap: 14, marginBottom: 24, flexWrap: 'wrap', width: '100%', minWidth: 0 },
+  statCard: { background: '#161619', border: '1px solid #232329', borderRadius: 10, padding: '16px 18px', flex: '1 1 150px', minWidth: 150, maxWidth: '100%', boxSizing: 'border-box', overflowWrap: 'break-word' },
   statLabel: { fontSize: 12.5, color: '#8f8f99', marginBottom: 6 },
   statValue: { fontFamily: FONT_MONO, fontSize: 20, fontWeight: 700 },
 
-  panel: { background: '#141418', border: '1px solid #232329', borderRadius: 12, padding: 24, marginBottom: 24 },
+  panel: { background: '#141418', border: '1px solid #232329', borderRadius: 12, padding: 24, marginBottom: 24, width: '100%', maxWidth: '100%', boxSizing: 'border-box', overflow: 'hidden' },
   panelTitle: { fontSize: 15, fontWeight: 700, marginBottom: 20, color: '#e8e8ec' },
   panelNote: { fontSize: 13, color: '#8f8f99', marginTop: 18, lineHeight: 1.6 },
 
-  barsRow: { display: 'flex', gap: 10, alignItems: 'flex-end', height: 160, overflowX: 'auto', paddingBottom: 4 },
+  barsRow: { display: 'flex', gap: 10, alignItems: 'flex-end', height: 160, overflowX: 'auto', paddingBottom: 4, width: '100%', maxWidth: '100%', boxSizing: 'border-box' },
   barCol: { flex: '1 1 0', minWidth: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'flex-end' },
   barTrack: { width: '100%', flex: 1, display: 'flex', alignItems: 'flex-end', background: '#1a1a20', borderRadius: 5, overflow: 'hidden' },
   barFill: { width: '100%', borderRadius: '5px 5px 0 0', minHeight: 2, transition: 'height 0.3s ease' },
