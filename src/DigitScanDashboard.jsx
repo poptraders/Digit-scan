@@ -990,7 +990,7 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
         currency: 'USD',
         duration: 1,
         duration_unit: 't',
-        symbol,
+        underlying_symbol: symbol, // new Options API renames 'symbol' to 'underlying_symbol' for contract calls
         ...(needsBarrier ? { barrier: String(predDigit) } : {}),
       });
       if (proposal.proposal) {
