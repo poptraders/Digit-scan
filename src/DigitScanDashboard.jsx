@@ -86,6 +86,7 @@ export default function DigitScanDashboard() {
 
   const wsRef = useRef(null);
   const tradeWsRef = useRef(null); // separate, OTP-authenticated socket for balance/buy/portfolio
+  const contractCallbacksRef = useRef({}); // contract_id -> callback, fired when that contract settles (win/loss)
   const pendingRef = useRef({}); // req_id -> resolver
   const historyReqSymbol = useRef(null);
 
@@ -238,6 +239,16 @@ export default function DigitScanDashboard() {
     });
   }, []);
 
+  // Subscribes to a placed contract's live status and fires onSettled(won: boolean)
+  // once it resolves — needed so martingale staking can react to the REAL outcome
+  // of each trade, not just assume anything.
+  const subscribeToContract = useCallback((contractId, onSettled) => {
+    contractCallbacksRef.current[contractId] = onSettled;
+    if (tradeWsRef.current && tradeWsRef.current.readyState === 1) {
+      tradeWsRef.current.send(JSON.stringify({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1 }));
+    }
+  }, []);
+
   const lastSubscribedRef = useRef(null);
   const hasSubscribedOnceRef = useRef(false);
 
@@ -331,6 +342,16 @@ export default function DigitScanDashboard() {
         if (data.msg_type === 'buy' && data.buy) {
           log(`Trade placed: contract ${data.buy.contract_id}, buy price ${data.buy.buy_price}`, 'ok');
         }
+        if (data.msg_type === 'proposal_open_contract' && data.proposal_open_contract) {
+          const poc = data.proposal_open_contract;
+          if (poc.is_sold) {
+            const cb = contractCallbacksRef.current[poc.contract_id];
+            if (cb) {
+              cb(Number(poc.profit) > 0);
+              delete contractCallbacksRef.current[poc.contract_id];
+            }
+          }
+        }
       };
 
       tradeWs.onerror = () => log('Trade socket connection error', 'error');
@@ -419,6 +440,7 @@ export default function DigitScanDashboard() {
               symbol={symbol}
               authStatus={authStatus}
               sendTradeRequest={sendTradeRequest}
+              subscribeToContract={subscribeToContract}
               digits={digits}
               log={log}
               balance={balance}
@@ -816,7 +838,7 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
             </select>
           </Field>
           <Field label="Digit">
-            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={styles.input} disabled={direction === 'odd' || direction === 'even'} />
+            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={direction === 'odd' || direction === 'even' ? styles.inputDisabled : styles.input} disabled={direction === 'odd' || direction === 'even'} />
           </Field>
           <Field label="Stake (per trade)">
             <input type="number" min={0.5} step={0.5} value={stake} onChange={e => setStake(Number(e.target.value))} style={styles.input} />
@@ -928,16 +950,26 @@ function EquityChart({ curve }) {
 }
 
 // ---------- Auto-Trader View ----------
-function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, balance }) {
+function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContract, digits, log, balance }) {
   const [enabled, setEnabled] = useState(false);
   const [predDigit, setPredDigit] = useState(5);
   const [direction, setDirection] = useState('over');
   const [stake, setStake] = useState(2);
+  const [staking, setStaking] = useState('flat'); // flat | martingale
+  const [martingaleMult, setMartingaleMult] = useState(2);
+  const [currentStake, setCurrentStake] = useState(2);
   const [maxLosses, setMaxLosses] = useState(3);
   const [lossStreak, setLossStreak] = useState(0);
   const [tradesPlaced, setTradesPlaced] = useState(0);
+  const [placing, setPlacing] = useState(false);
 
   const isDemo = authStatus === 'ok';
+
+  // Keep currentStake in sync with the base stake whenever it changes, unless
+  // we're mid-martingale-progression (a loss streak in progress).
+  useEffect(() => {
+    if (lossStreak === 0) setCurrentStake(Number(stake));
+  }, [stake, lossStreak]);
 
   const contractType = {
     over: 'DIGITOVER', under: 'DIGITUNDER', match: 'DIGITMATCH', differ: 'DIGITDIFF',
@@ -946,11 +978,13 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, bal
 
   const placeTrade = async () => {
     if (!isDemo) { log('Authorize an account first (Account tab)', 'warn'); return; }
+    setPlacing(true);
     try {
       const needsBarrier = direction !== 'odd' && direction !== 'even';
+      const stakeToUse = staking === 'martingale' ? currentStake : Number(stake);
       const proposal = await sendTradeRequest({
         proposal: 1,
-        amount: Number(stake),
+        amount: stakeToUse,
         basis: 'stake',
         contract_type: contractType,
         currency: 'USD',
@@ -963,11 +997,29 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, bal
         const buy = await sendTradeRequest({ buy: proposal.proposal.id, price: proposal.proposal.ask_price });
         if (buy.buy) {
           setTradesPlaced(n => n + 1);
+          log('Waiting for contract to settle…', 'info');
+          subscribeToContract(buy.buy.contract_id, (won) => {
+            if (won) {
+              log(`Contract ${buy.buy.contract_id} won`, 'ok');
+              setLossStreak(0);
+              if (staking === 'martingale') setCurrentStake(Number(stake));
+            } else {
+              log(`Contract ${buy.buy.contract_id} lost`, 'warn');
+              setLossStreak(s => s + 1);
+              if (staking === 'martingale') setCurrentStake(s => Number((s * Number(martingaleMult)).toFixed(2)));
+            }
+            setPlacing(false);
+          });
+        } else {
+          setPlacing(false);
         }
+      } else {
+        setPlacing(false);
       }
     } catch (e) {
       log(`Trade failed: ${e.message || e.error?.message || 'unknown error'}`, 'error');
       setEnabled(false);
+      setPlacing(false);
     }
   };
 
@@ -1008,11 +1060,22 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, bal
             </select>
           </Field>
           <Field label="Digit">
-            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={styles.input} disabled={direction === 'odd' || direction === 'even'} />
+            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={direction === 'odd' || direction === 'even' ? styles.inputDisabled : styles.input} disabled={direction === 'odd' || direction === 'even'} />
           </Field>
           <Field label="Stake">
             <input type="number" min={0.5} step={0.5} value={stake} onChange={e => setStake(Number(e.target.value))} style={styles.input} />
           </Field>
+          <Field label="Staking plan">
+            <select value={staking} onChange={e => setStaking(e.target.value)} style={styles.select}>
+              <option value="flat">Flat</option>
+              <option value="martingale">Martingale</option>
+            </select>
+          </Field>
+          {staking === 'martingale' && (
+            <Field label="Martingale multiplier">
+              <input type="number" min={1.1} step={0.1} value={martingaleMult} onChange={e => setMartingaleMult(Number(e.target.value))} style={styles.input} />
+            </Field>
+          )}
           <Field label="Stop after N consecutive losses">
             <input type="number" min={1} value={maxLosses} onChange={e => setMaxLosses(Number(e.target.value))} style={styles.input} />
           </Field>
@@ -1022,18 +1085,24 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, digits, log, bal
           <StatCard label="Trades this session" value={tradesPlaced} />
           <StatCard label="Loss streak" value={lossStreak} />
           <StatCard label="Balance" value={balance != null ? balance : '—'} />
+          {staking === 'martingale' && <StatCard label="Next stake" value={currentStake.toFixed(2)} />}
         </div>
 
         <button
-          onClick={() => { if (isDemo) placeTrade(); }}
-          disabled={!isDemo}
-          style={{ ...styles.primaryBtn, opacity: isDemo ? 1 : 0.5 }}
+          onClick={() => { if (isDemo && !placing) placeTrade(); }}
+          disabled={!isDemo || placing}
+          style={{ ...styles.primaryBtn, opacity: (isDemo && !placing) ? 1 : 0.5 }}
         >
-          Place single trade (manual)
+          {placing ? 'Placing…' : 'Place single trade (manual)'}
         </button>
         <div style={styles.panelNote}>
           Continuous auto-execution is intentionally left manual-trigger only for now — wire up a backtested rule set here once you've confirmed it's worth running unattended. Every trade shown in the log ties back to the account authorized in the Account tab.
         </div>
+        {staking === 'martingale' && (
+          <div style={{ ...styles.panelNote, color: '#e8b04b' }}>
+            Martingale increases your stake after each loss and resets on a win — it does not create a real edge, only redistributes risk into rarer, larger losses. The "Stop after N consecutive losses" limit is your only real protection here.
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1170,12 +1239,12 @@ const styles = {
   panelTitle: { fontSize: 15, fontWeight: 700, marginBottom: 20, color: '#e8e8ec' },
   panelNote: { fontSize: 13, color: '#8f8f99', marginTop: 18, lineHeight: 1.6 },
 
-  barsRow: { display: 'flex', gap: 10, alignItems: 'flex-end', height: 160, overflowX: 'auto', paddingBottom: 4, width: '100%', maxWidth: '100%', boxSizing: 'border-box' },
-  barCol: { flex: '1 1 0', minWidth: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'flex-end' },
+  barsRow: { display: 'flex', gap: 4, alignItems: 'flex-end', height: 150, overflowX: 'auto', paddingBottom: 4, width: '100%', maxWidth: '100%', boxSizing: 'border-box' },
+  barCol: { flex: '1 1 0', minWidth: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'flex-end' },
   barTrack: { width: '100%', flex: 1, display: 'flex', alignItems: 'flex-end', background: '#1a1a20', borderRadius: 5, overflow: 'hidden' },
   barFill: { width: '100%', borderRadius: '5px 5px 0 0', minHeight: 2, transition: 'height 0.3s ease' },
-  barPct: { fontSize: 12, fontFamily: FONT_MONO, marginTop: 8, fontWeight: 600 },
-  barDigit: { fontSize: 14, fontFamily: FONT_MONO, color: '#8f8f99', marginTop: 4 },
+  barPct: { fontSize: 10, fontFamily: FONT_MONO, marginTop: 6, fontWeight: 600 },
+  barDigit: { fontSize: 12, fontFamily: FONT_MONO, color: '#8f8f99', marginTop: 3 },
 
   digitStrip: { display: 'flex', gap: 6, flexWrap: 'wrap' },
   digitChip: { width: 32, height: 32, borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: FONT_MONO, fontSize: 14, fontWeight: 700, color: '#0f0f13' },
@@ -1184,6 +1253,7 @@ const styles = {
   field: { display: 'flex', flexDirection: 'column', gap: 8 },
   fieldLabel: { fontSize: 13, color: '#a8a8b3', fontWeight: 500 },
   input: { background: '#1a1a20', border: '1px solid #2c2c34', color: '#e8e8ec', padding: '12px 14px', borderRadius: 8, fontSize: 15, fontFamily: FONT_MONO, width: '100%' },
+  inputDisabled: { background: '#141418', border: '1px solid #232329', color: '#5a5a64', padding: '12px 14px', borderRadius: 8, fontSize: 15, fontFamily: FONT_MONO, width: '100%', cursor: 'not-allowed' },
 
   primaryBtn: { background: '#3fb68a', color: '#0f0f13', border: 'none', padding: '13px 24px', borderRadius: 8, fontSize: 14.5, fontWeight: 700, cursor: 'pointer', fontFamily: FONT_SANS },
   secondaryBtn: { background: 'transparent', color: '#a8a8b3', border: '1px solid #2c2c34', padding: '13px 24px', borderRadius: 8, fontSize: 14.5, cursor: 'pointer', fontFamily: FONT_SANS, fontWeight: 500 },
