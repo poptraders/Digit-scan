@@ -271,7 +271,7 @@ export default function DigitScanDashboard() {
     const ticksPayload = { ticks: sym, subscribe: 1 };
     log(`Sending: ${JSON.stringify(ticksPayload)}`, 'info');
     wsRef.current.send(JSON.stringify(ticksPayload));
-    wsRef.current.send(JSON.stringify({ active_symbols: 'brief', product_type: 'basic' }));
+    wsRef.current.send(JSON.stringify({ active_symbols: 'brief' }));
     log(`Subscribed to ${sym}`, 'info');
     hasSubscribedOnceRef.current = true;
   }, [log, sendRequest]);
@@ -298,9 +298,13 @@ export default function DigitScanDashboard() {
           'Authorization': `Bearer ${token.trim()}`,
         },
       });
-      const otpJson = await otpRes.json();
+      const otpText = await otpRes.text();
+      let otpJson = null;
+      try { otpJson = JSON.parse(otpText); } catch { /* response wasn't JSON — handled below */ }
+
       if (!otpRes.ok || !otpJson?.data?.url) {
-        const msg = otpJson?.errors?.[0]?.message || `HTTP ${otpRes.status}`;
+        const msg = otpJson?.errors?.[0]?.message
+          || (otpText && otpText.length < 200 ? otpText : `HTTP ${otpRes.status}`);
         throw new Error(msg);
       }
 
@@ -347,7 +351,8 @@ export default function DigitScanDashboard() {
           if (poc.is_sold) {
             const cb = contractCallbacksRef.current[poc.contract_id];
             if (cb) {
-              cb(Number(poc.profit) > 0);
+              const profit = Number(poc.profit) || 0;
+              cb(profit > 0, profit);
               delete contractCallbacksRef.current[poc.contract_id];
             }
           }
@@ -378,6 +383,21 @@ export default function DigitScanDashboard() {
       tradeWsRef.current = null;
     }
     log('Token cleared from session', 'info');
+  };
+
+  const handleTopUpDemo = async () => {
+    if (authStatus !== 'ok') { log('Authorize first before topping up', 'warn'); return; }
+    if (!accountInfo?.is_virtual) { log('Top-up only works on demo accounts, not real ones', 'warn'); return; }
+    try {
+      const res = await sendTradeRequest({ topup_virtual: 1 });
+      if (res.topup_virtual) {
+        log(`Demo balance topped up: ${res.topup_virtual.amount || ''}`, 'ok');
+        // The balance subscription already running from authorization will
+        // push the updated figure automatically — no need to re-request it.
+      }
+    } catch (e) {
+      log(`Top-up failed: ${e.message || 'unknown error'}`, 'error');
+    }
   };
 
   // ---------- Digit analysis ----------
@@ -457,6 +477,7 @@ export default function DigitScanDashboard() {
               balance={balance}
               onAuthorize={handleAuthorize}
               onForget={handleForgetToken}
+              onTopUp={handleTopUpDemo}
             />
           )}
         </main>
@@ -951,19 +972,38 @@ function EquityChart({ curve }) {
 
 // ---------- Auto-Trader View ----------
 function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContract, digits, log, balance }) {
-  const [enabled, setEnabled] = useState(false);
+  const [enabled, setEnabled] = useState(false); // true while the auto-loop is running
   const [predDigit, setPredDigit] = useState(5);
   const [direction, setDirection] = useState('over');
+  const [duration, setDuration] = useState(1); // contract duration in ticks
   const [stake, setStake] = useState(2);
   const [staking, setStaking] = useState('flat'); // flat | martingale
   const [martingaleMult, setMartingaleMult] = useState(2);
   const [currentStake, setCurrentStake] = useState(2);
   const [maxLosses, setMaxLosses] = useState(3);
+  const [maxDrawdown, setMaxDrawdown] = useState(0); // 0 = no limit
+  const [profitTarget, setProfitTarget] = useState(0); // 0 = no limit
   const [lossStreak, setLossStreak] = useState(0);
   const [tradesPlaced, setTradesPlaced] = useState(0);
+  const [sessionPL, setSessionPL] = useState(0);
+  const [peakPL, setPeakPL] = useState(0);
   const [placing, setPlacing] = useState(false);
+  const [stopReason, setStopReason] = useState('');
 
   const isDemo = authStatus === 'ok';
+
+  // Config ref stays current every render so the async settlement callback
+  // (which fires later, after a real network round-trip) always reads the
+  // latest settings rather than a stale value captured when it was created.
+  const configRef = useRef({});
+  configRef.current = { direction, predDigit, stake, staking, martingaleMult, maxLosses, maxDrawdown, profitTarget, duration, symbol };
+  const runningRef = useRef(false);
+  runningRef.current = enabled;
+
+  const drawdown = Math.max(0, peakPL - sessionPL);
+  const lossStreakRef = useRef(0);
+  const sessionPLRef = useRef(0);
+  const peakPLRef = useRef(0);
 
   // Keep currentStake in sync with the base stake whenever it changes, unless
   // we're mid-martingale-progression (a loss streak in progress).
@@ -971,66 +1011,110 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
     if (lossStreak === 0) setCurrentStake(Number(stake));
   }, [stake, lossStreak]);
 
-  const contractType = {
+  const contractTypeFor = (dir) => ({
     over: 'DIGITOVER', under: 'DIGITUNDER', match: 'DIGITMATCH', differ: 'DIGITDIFF',
     odd: 'DIGITODD', even: 'DIGITEVEN',
-  }[direction];
+  }[dir]);
 
-  const placeTrade = async () => {
+  const placeTrade = async (isAutoLoop) => {
     if (!isDemo) { log('Authorize an account first (Account tab)', 'warn'); return; }
     setPlacing(true);
     try {
-      const needsBarrier = direction !== 'odd' && direction !== 'even';
-      const stakeToUse = staking === 'martingale' ? currentStake : Number(stake);
+      const cfg = configRef.current;
+      const needsBarrier = cfg.direction !== 'odd' && cfg.direction !== 'even';
+      const stakeToUse = cfg.staking === 'martingale' ? currentStake : Number(cfg.stake);
       const proposal = await sendTradeRequest({
         proposal: 1,
         amount: stakeToUse,
         basis: 'stake',
-        contract_type: contractType,
+        contract_type: contractTypeFor(cfg.direction),
         currency: 'USD',
-        duration: 1,
+        duration: Math.max(1, Number(cfg.duration) || 1),
         duration_unit: 't',
-        underlying_symbol: symbol, // new Options API renames 'symbol' to 'underlying_symbol' for contract calls
-        ...(needsBarrier ? { barrier: String(predDigit) } : {}),
+        underlying_symbol: cfg.symbol, // new Options API renames 'symbol' to 'underlying_symbol' for contract calls
+        ...(needsBarrier ? { barrier: String(cfg.predDigit) } : {}),
       });
-      if (proposal.proposal) {
-        const buy = await sendTradeRequest({ buy: proposal.proposal.id, price: proposal.proposal.ask_price });
-        if (buy.buy) {
-          setTradesPlaced(n => n + 1);
-          log('Waiting for contract to settle…', 'info');
-          subscribeToContract(buy.buy.contract_id, (won) => {
-            if (won) {
-              log(`Contract ${buy.buy.contract_id} won`, 'ok');
-              setLossStreak(0);
-              if (staking === 'martingale') setCurrentStake(Number(stake));
-            } else {
-              log(`Contract ${buy.buy.contract_id} lost`, 'warn');
-              setLossStreak(s => s + 1);
-              if (staking === 'martingale') setCurrentStake(s => Number((s * Number(martingaleMult)).toFixed(2)));
-            }
-            setPlacing(false);
-          });
+      if (!proposal.proposal) { setPlacing(false); return; }
+
+      const buy = await sendTradeRequest({ buy: proposal.proposal.id, price: proposal.proposal.ask_price });
+      if (!buy.buy) { setPlacing(false); return; }
+
+      setTradesPlaced(n => n + 1);
+      log('Waiting for contract to settle…', 'info');
+
+      subscribeToContract(buy.buy.contract_id, (won, profit) => {
+        const sign = profit >= 0 ? '+' : '';
+        log(`Contract ${buy.buy.contract_id} ${won ? 'won' : 'lost'}: ${sign}${profit.toFixed(2)}`, won ? 'ok' : 'warn');
+
+        // Refs are the source of truth for loop-continuation decisions, since
+        // this callback fires after a real network delay and closure-captured
+        // state variables could be stale by then.
+        const nextPL = sessionPLRef.current + profit;
+        sessionPLRef.current = nextPL;
+        setSessionPL(nextPL);
+
+        const nextPeak = Math.max(peakPLRef.current, nextPL);
+        peakPLRef.current = nextPeak;
+        setPeakPL(nextPeak);
+
+        const nextLossStreak = won ? 0 : lossStreakRef.current + 1;
+        lossStreakRef.current = nextLossStreak;
+        setLossStreak(nextLossStreak);
+
+        if (won) {
+          if (cfg.staking === 'martingale') setCurrentStake(Number(cfg.stake));
         } else {
-          setPlacing(false);
+          if (cfg.staking === 'martingale') setCurrentStake(s => Number((s * Number(cfg.martingaleMult)).toFixed(2)));
         }
-      } else {
+
         setPlacing(false);
-      }
+
+        // Auto-loop: decide whether to continue, using the refs updated just above.
+        if (isAutoLoop && runningRef.current) {
+          const nextDrawdown = Math.max(0, nextPeak - nextPL);
+
+          if (nextLossStreak >= cfg.maxLosses) {
+            setStopReason(`Stopped: hit max consecutive losses (${cfg.maxLosses})`);
+            log(`Stopped: hit max consecutive losses (${cfg.maxLosses})`, 'warn');
+            setEnabled(false);
+            return;
+          }
+          if (cfg.maxDrawdown > 0 && nextDrawdown >= cfg.maxDrawdown) {
+            setStopReason(`Stopped: drawdown limit reached (${nextDrawdown.toFixed(2)})`);
+            log(`Stopped: drawdown limit reached (${nextDrawdown.toFixed(2)})`, 'warn');
+            setEnabled(false);
+            return;
+          }
+          if (cfg.profitTarget > 0 && nextPL >= cfg.profitTarget) {
+            setStopReason(`Stopped: profit target reached (${nextPL.toFixed(2)})`);
+            log(`Stopped: profit target reached (${nextPL.toFixed(2)})`, 'ok');
+            setEnabled(false);
+            return;
+          }
+          // All clear — place the next trade after a short pause.
+          setTimeout(() => { if (runningRef.current) placeTrade(true); }, 1500);
+        }
+      });
     } catch (e) {
       log(`Trade failed: ${e.message || e.error?.message || 'unknown error'}`, 'error');
+      setStopReason('Stopped: an error occurred');
       setEnabled(false);
       setPlacing(false);
     }
   };
 
-  useEffect(() => {
-    if (!enabled) return;
-    if (lossStreak >= maxLosses) {
-      log(`Stopped: hit max consecutive losses (${maxLosses})`, 'warn');
-      setEnabled(false);
-      return;
-    }
-  }, [lossStreak, maxLosses, enabled, log]);
+  const startAutoLoop = () => {
+    if (!isDemo || placing || enabled) return;
+    setStopReason('');
+    setEnabled(true);
+    placeTrade(true);
+  };
+
+  const stopAutoLoop = () => {
+    setEnabled(false);
+    setStopReason('Stopped: manual stop');
+    log('Auto-loop stopped manually', 'info');
+  };
 
   return (
     <div>
@@ -1047,10 +1131,16 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
         </div>
       )}
 
+      {enabled && (
+        <div style={{ ...styles.warnBanner, background: '#1c3d33', color: '#3fb68a' }}>
+          Auto-loop running — placing a new trade automatically after each one settles. Stop anytime with the button below.
+        </div>
+      )}
+
       <div style={styles.panel}>
         <div style={styles.formGrid}>
           <Field label="Prediction type">
-            <select value={direction} onChange={e => setDirection(e.target.value)} style={styles.select}>
+            <select value={direction} onChange={e => setDirection(e.target.value)} disabled={enabled} style={enabled ? styles.inputDisabled : styles.select}>
               <option value="over">Over</option>
               <option value="under">Under</option>
               <option value="match">Matches</option>
@@ -1060,47 +1150,80 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
             </select>
           </Field>
           <Field label="Digit">
-            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={direction === 'odd' || direction === 'even' ? styles.inputDisabled : styles.input} disabled={direction === 'odd' || direction === 'even'} />
+            <input type="number" min={0} max={9} value={predDigit} onChange={e => setPredDigit(Math.max(0, Math.min(9, Number(e.target.value) || 0)))} style={(direction === 'odd' || direction === 'even' || enabled) ? styles.inputDisabled : styles.input} disabled={direction === 'odd' || direction === 'even' || enabled} />
+          </Field>
+          <Field label="Duration (ticks)">
+            <input type="number" min={1} max={10} value={duration} onChange={e => setDuration(Math.max(1, Math.min(10, Number(e.target.value) || 1)))} disabled={enabled} style={enabled ? styles.inputDisabled : styles.input} />
           </Field>
           <Field label="Stake">
-            <input type="number" min={0.5} step={0.5} value={stake} onChange={e => setStake(Number(e.target.value))} style={styles.input} />
+            <input type="number" min={0.5} step={0.5} value={stake} onChange={e => setStake(Number(e.target.value))} disabled={enabled} style={enabled ? styles.inputDisabled : styles.input} />
           </Field>
           <Field label="Staking plan">
-            <select value={staking} onChange={e => setStaking(e.target.value)} style={styles.select}>
+            <select value={staking} onChange={e => setStaking(e.target.value)} disabled={enabled} style={enabled ? styles.inputDisabled : styles.select}>
               <option value="flat">Flat</option>
               <option value="martingale">Martingale</option>
             </select>
           </Field>
           {staking === 'martingale' && (
             <Field label="Martingale multiplier">
-              <input type="number" min={1.1} step={0.1} value={martingaleMult} onChange={e => setMartingaleMult(Number(e.target.value))} style={styles.input} />
+              <input type="number" min={1.1} step={0.1} value={martingaleMult} onChange={e => setMartingaleMult(Number(e.target.value))} disabled={enabled} style={enabled ? styles.inputDisabled : styles.input} />
             </Field>
           )}
           <Field label="Stop after N consecutive losses">
-            <input type="number" min={1} value={maxLosses} onChange={e => setMaxLosses(Number(e.target.value))} style={styles.input} />
+            <input type="number" min={1} value={maxLosses} onChange={e => setMaxLosses(Number(e.target.value))} disabled={enabled} style={enabled ? styles.inputDisabled : styles.input} />
+          </Field>
+          <Field label="Max drawdown ($, 0 = no limit)">
+            <input type="number" min={0} step={1} value={maxDrawdown} onChange={e => setMaxDrawdown(Number(e.target.value))} disabled={enabled} style={enabled ? styles.inputDisabled : styles.input} />
+          </Field>
+          <Field label="Profit target ($, 0 = no limit)">
+            <input type="number" min={0} step={1} value={profitTarget} onChange={e => setProfitTarget(Number(e.target.value))} disabled={enabled} style={enabled ? styles.inputDisabled : styles.input} />
           </Field>
         </div>
 
         <div style={styles.statRow}>
           <StatCard label="Trades this session" value={tradesPlaced} />
+          <StatCard label="Session P/L" value={sessionPL.toFixed(2)} />
+          <StatCard label="Drawdown" value={drawdown.toFixed(2)} />
           <StatCard label="Loss streak" value={lossStreak} />
           <StatCard label="Balance" value={balance != null ? balance : '—'} />
           {staking === 'martingale' && <StatCard label="Next stake" value={currentStake.toFixed(2)} />}
         </div>
 
-        <button
-          onClick={() => { if (isDemo && !placing) placeTrade(); }}
-          disabled={!isDemo || placing}
-          style={{ ...styles.primaryBtn, opacity: (isDemo && !placing) ? 1 : 0.5 }}
-        >
-          {placing ? 'Placing…' : 'Place single trade (manual)'}
-        </button>
+        {stopReason && !enabled && (
+          <div style={{ ...styles.panelNote, color: stopReason.includes('profit target') ? '#3fb68a' : '#e8b04b' }}>
+            {stopReason}
+          </div>
+        )}
+
+        <div style={styles.btnRow}>
+          <button
+            onClick={() => { if (isDemo && !placing && !enabled) placeTrade(false); }}
+            disabled={!isDemo || placing || enabled}
+            style={{ ...styles.primaryBtn, opacity: (isDemo && !placing && !enabled) ? 1 : 0.5 }}
+          >
+            {placing && !enabled ? 'Placing…' : 'Place single trade (manual)'}
+          </button>
+          {!enabled ? (
+            <button
+              onClick={startAutoLoop}
+              disabled={!isDemo || placing}
+              style={{ ...styles.secondaryBtn, borderColor: '#3fb68a', color: '#3fb68a', opacity: (!isDemo || placing) ? 0.5 : 1 }}
+            >
+              Start auto-trading
+            </button>
+          ) : (
+            <button onClick={stopAutoLoop} style={{ ...styles.secondaryBtn, borderColor: '#e2664a', color: '#e2664a' }}>
+              Stop
+            </button>
+          )}
+        </div>
+
         <div style={styles.panelNote}>
-          Continuous auto-execution is intentionally left manual-trigger only for now — wire up a backtested rule set here once you've confirmed it's worth running unattended. Every trade shown in the log ties back to the account authorized in the Account tab.
+          Auto-trading places a new trade automatically after each one settles, using exactly the rule above — it does not predict outcomes, only executes consistently. Stops on its own if it hits your consecutive-loss limit, drawdown limit, or profit target, whichever comes first.
         </div>
         {staking === 'martingale' && (
           <div style={{ ...styles.panelNote, color: '#e8b04b' }}>
-            Martingale increases your stake after each loss and resets on a win — it does not create a real edge, only redistributes risk into rarer, larger losses. The "Stop after N consecutive losses" limit is your only real protection here.
+            Martingale increases your stake after each loss and resets on a win — it does not create a real edge, only redistributes risk into rarer, larger losses. Your consecutive-loss and drawdown limits are your only real protection here.
           </div>
         )}
       </div>
@@ -1109,7 +1232,7 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
 }
 
 // ---------- Settings View ----------
-function SettingsView({ token, setToken, accountId, setAccountId, otpAppId, setOtpAppId, rememberToken, setRememberToken, authStatus, accountInfo, balance, onAuthorize, onForget }) {
+function SettingsView({ token, setToken, accountId, setAccountId, otpAppId, setOtpAppId, rememberToken, setRememberToken, authStatus, accountInfo, balance, onAuthorize, onForget, onTopUp }) {
   return (
     <div>
       <div style={styles.viewHeader}>
@@ -1165,6 +1288,11 @@ function SettingsView({ token, setToken, accountId, setAccountId, otpAppId, setO
             </div>
             <div style={styles.acctRow}><span>Login ID</span><span>{accountInfo.loginid}</span></div>
             <div style={styles.acctRow}><span>Balance</span><span>{balance} {accountInfo.currency}</span></div>
+            {accountInfo.is_virtual && (
+              <button onClick={onTopUp} style={{ ...styles.secondaryBtn, marginTop: 14 }}>
+                Top up demo balance
+              </button>
+            )}
           </div>
         )}
 
