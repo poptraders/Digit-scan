@@ -704,6 +704,24 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
   const [filterDigit7, setFilterDigit7] = useState(true);
   const [filterThreshold7, setFilterThreshold7] = useState(10.5);
 
+  // Odd/Even bias filter — only trade when recent history is skewed toward
+  // the predicted type (e.g. 12+ of the last 20 digits were Odd).
+  const [useBiasFilter, setUseBiasFilter] = useState(false);
+  const [biasWindow, setBiasWindow] = useState(20);
+  const [biasThreshold, setBiasThreshold] = useState(12);
+
+  // Streak guard — pause trading Odd/Even after a long run of the same parity,
+  // on the theory that a long streak precedes a volatility spike.
+  const [useStreakGuard, setUseStreakGuard] = useState(false);
+  const [streakThreshold, setStreakThreshold] = useState(5);
+
+  // Percentage-based take-profit / stop-loss, relative to a starting balance —
+  // stops the simulated run early once either is hit, same as a real session would.
+  const [useTpSl, setUseTpSl] = useState(false);
+  const [startingBalance, setStartingBalance] = useState(100);
+  const [takeProfitPct, setTakeProfitPct] = useState(10);
+  const [stopLossPct, setStopLossPct] = useState(10);
+
   const runBacktest = async () => {
     if (!connected) { log('Not connected to feed', 'warn'); return; }
     setRunning(true);
@@ -764,6 +782,7 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
       let currentLossStreak = 0;
       let longestLossStreak = 0;
       let peakStakeRequired = Number(stake);
+      let stoppedEarlyReason = null;
 
       const filterDigitList = filterDigits.split(',').map(s => Number(s.trim())).filter(n => !isNaN(n));
 
@@ -783,8 +802,44 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
         return otherDigitsOk && digit7Ok;
       };
 
-      digitSeq.forEach((d, i) => {
-        if (!passesFilter(i)) { skipped++; return; } // no trade this tick — condition not met
+      // Odd/Even bias filter — only meaningful for those two prediction types.
+      const passesBiasFilter = (i) => {
+        if (!useBiasFilter) return true;
+        if (direction !== 'odd' && direction !== 'even') return true;
+        if (i < biasWindow) return false;
+        const windowSlice = digitSeq.slice(i - biasWindow, i);
+        const matchCount = windowSlice.filter(d => (direction === 'odd' ? d % 2 === 1 : d % 2 === 0)).length;
+        return matchCount >= biasThreshold;
+      };
+
+      // Precompute, for each index, the length of the same-parity streak that
+      // occurred strictly BEFORE that index — real look-back, no future data.
+      const streakBeforeIndex = new Array(digitSeq.length);
+      {
+        let curType = null, curCount = 0;
+        for (let i = 0; i < digitSeq.length; i++) {
+          streakBeforeIndex[i] = curCount;
+          const parity = digitSeq[i] % 2 === 0 ? 'even' : 'odd';
+          if (parity === curType) curCount++;
+          else { curType = parity; curCount = 1; }
+        }
+      }
+      const passesStreakGuard = (i) => {
+        if (!useStreakGuard) return true;
+        if (direction !== 'odd' && direction !== 'even') return true;
+        return streakBeforeIndex[i] < streakThreshold;
+      };
+
+      const tpAmount = Number(startingBalance) * (Number(takeProfitPct) / 100);
+      const slAmount = Number(startingBalance) * (Number(stopLossPct) / 100);
+
+      for (let i = 0; i < digitSeq.length; i++) {
+        const d = digitSeq[i];
+
+        if (!passesFilter(i) || !passesBiasFilter(i) || !passesStreakGuard(i)) {
+          skipped++;
+          continue; // no trade this tick — some condition not met
+        }
 
         let win;
         if (direction === 'over') win = d > predDigit;
@@ -813,7 +868,12 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
         peak = Math.max(peak, bank);
         trough = Math.min(trough, bank);
         maxDrawdown = Math.min(maxDrawdown, bank - peak);
-      });
+
+        if (useTpSl) {
+          if (bank >= tpAmount) { stoppedEarlyReason = `take-profit hit (+${bank.toFixed(2)})`; break; }
+          if (bank <= -slAmount) { stoppedEarlyReason = `stop-loss hit (${bank.toFixed(2)})`; break; }
+        }
+      }
 
       const winRate = (wins + losses) > 0 ? (wins / (wins + losses)) * 100 : 0;
       setResult({
@@ -826,8 +886,9 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
         maxDrawdown,
         equityCurve,
         finalStake: currentStake,
+        stoppedEarlyReason,
       });
-      log(`Backtest complete: ${wins + losses} trades (${skipped} skipped by filter), ${winRate.toFixed(1)}% win rate, net P/L ${bank.toFixed(2)}`, bank >= 0 ? 'ok' : 'warn');
+      log(`Backtest complete: ${wins + losses} trades (${skipped} skipped by filter), ${winRate.toFixed(1)}% win rate, net P/L ${bank.toFixed(2)}${stoppedEarlyReason ? ` — stopped early: ${stoppedEarlyReason}` : ''}`, bank >= 0 ? 'ok' : 'warn');
     } catch (e) {
       log(`Backtest failed: ${e.message || 'unknown error'} (batch ${batchNum + 1}, ${allPrices.length} ticks fetched so far)`, 'error');
     }
@@ -910,6 +971,55 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
           </div>
         )}
 
+        {(direction === 'odd' || direction === 'even') && (
+          <>
+            <label style={styles.checkboxRow}>
+              <input type="checkbox" checked={useBiasFilter} onChange={e => setUseBiasFilter(e.target.checked)} />
+              Only trade when recent digits are biased toward {direction === 'odd' ? 'Odd' : 'Even'}
+            </label>
+            {useBiasFilter && (
+              <div style={{ ...styles.formGrid, marginTop: 4 }}>
+                <Field label="Lookback window (ticks)">
+                  <input type="number" min={5} max={200} value={biasWindow} onChange={e => setBiasWindow(Number(e.target.value))} style={styles.input} />
+                </Field>
+                <Field label={`Min ${direction === 'odd' ? 'Odd' : 'Even'} count needed`}>
+                  <input type="number" min={1} max={biasWindow} value={biasThreshold} onChange={e => setBiasThreshold(Number(e.target.value))} style={styles.input} />
+                </Field>
+              </div>
+            )}
+
+            <label style={styles.checkboxRow}>
+              <input type="checkbox" checked={useStreakGuard} onChange={e => setUseStreakGuard(e.target.checked)} />
+              Pause after a long same-parity streak
+            </label>
+            {useStreakGuard && (
+              <div style={{ ...styles.formGrid, marginTop: 4 }}>
+                <Field label="Pause if streak reaches">
+                  <input type="number" min={2} max={20} value={streakThreshold} onChange={e => setStreakThreshold(Number(e.target.value))} style={styles.input} />
+                </Field>
+              </div>
+            )}
+          </>
+        )}
+
+        <label style={styles.checkboxRow}>
+          <input type="checkbox" checked={useTpSl} onChange={e => setUseTpSl(e.target.checked)} />
+          Stop early at a take-profit / stop-loss threshold
+        </label>
+        {useTpSl && (
+          <div style={{ ...styles.formGrid, marginTop: 4 }}>
+            <Field label="Starting balance ($)">
+              <input type="number" min={1} value={startingBalance} onChange={e => setStartingBalance(Number(e.target.value))} style={styles.input} />
+            </Field>
+            <Field label="Take profit (%)">
+              <input type="number" min={1} max={1000} value={takeProfitPct} onChange={e => setTakeProfitPct(Number(e.target.value))} style={styles.input} />
+            </Field>
+            <Field label="Stop loss (%)">
+              <input type="number" min={1} max={100} value={stopLossPct} onChange={e => setStopLossPct(Number(e.target.value))} style={styles.input} />
+            </Field>
+          </div>
+        )}
+
         <button onClick={runBacktest} disabled={running} style={styles.primaryBtn}>
           {running ? 'Running…' : 'Run backtest'}
         </button>
@@ -931,6 +1041,11 @@ function BacktestView({ symbol, pipSize, sendRequest, connected, log }) {
             )}
           </div>
           <EquityChart curve={result.equityCurve} />
+          {result.stoppedEarlyReason && (
+            <div style={{ ...styles.panelNote, color: '#8f8f99' }}>
+              Simulation stopped early: {result.stoppedEarlyReason}. Everything above reflects only the ticks processed up to that point, not the full sample.
+            </div>
+          )}
           <div style={{ ...styles.panelNote, color: result.netPL >= 0 ? '#3fb68a' : '#e2664a' }}>
             {result.netPL >= 0
               ? 'Positive over this sample — verify across more symbols and longer windows before trusting it; short samples can look profitable by chance.'
