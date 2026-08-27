@@ -1086,18 +1086,39 @@ function EquityChart({ curve }) {
 }
 
 // ---------- Auto-Trader View ----------
+const AUTOTRADER_SETTINGS_KEY = 'digitscan_autotrader_settings_v1';
+
+function loadSavedAutoTraderSettings() {
+  try {
+    const raw = localStorage.getItem(AUTOTRADER_SETTINGS_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAutoTraderSettings(settings) {
+  try {
+    localStorage.setItem(AUTOTRADER_SETTINGS_KEY, JSON.stringify(settings));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContract, digits, log, balance }) {
+  const saved = loadSavedAutoTraderSettings();
   const [enabled, setEnabled] = useState(false); // true while the auto-loop is running
-  const [predDigit, setPredDigit] = useState(5);
-  const [direction, setDirection] = useState('over');
-  const [duration, setDuration] = useState(1); // contract duration in ticks
-  const [stake, setStake] = useState(2);
-  const [staking, setStaking] = useState('flat'); // flat | martingale
-  const [martingaleMult, setMartingaleMult] = useState(2);
-  const [currentStake, setCurrentStake] = useState(2);
-  const [maxLosses, setMaxLosses] = useState(3);
-  const [maxDrawdown, setMaxDrawdown] = useState(0); // 0 = no limit
-  const [profitTarget, setProfitTarget] = useState(0); // 0 = no limit
+  const [predDigit, setPredDigit] = useState(saved.predDigit ?? 5);
+  const [direction, setDirection] = useState(saved.direction ?? 'over');
+  const [duration, setDuration] = useState(saved.duration ?? 1); // contract duration in ticks
+  const [stake, setStake] = useState(saved.stake ?? 2);
+  const [staking, setStaking] = useState(saved.staking ?? 'flat'); // flat | martingale
+  const [martingaleMult, setMartingaleMult] = useState(saved.martingaleMult ?? 2);
+  const [currentStake, setCurrentStake] = useState(saved.stake ?? 2);
+  const [maxLosses, setMaxLosses] = useState(saved.maxLosses ?? 3);
+  const [maxDrawdown, setMaxDrawdown] = useState(saved.maxDrawdown ?? 0); // 0 = no limit
+  const [profitTarget, setProfitTarget] = useState(saved.profitTarget ?? 0); // 0 = no limit
   const [lossStreak, setLossStreak] = useState(0);
   const [tradesPlaced, setTradesPlaced] = useState(0);
   const [sessionPL, setSessionPL] = useState(0);
@@ -1106,6 +1127,16 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
   const [stopReason, setStopReason] = useState('');
 
   const isDemo = authStatus === 'ok';
+
+  // Persist the rule settings (not credentials — those stay memory-only) so
+  // they survive a page reload instead of resetting every session.
+  useEffect(() => {
+    try {
+      localStorage.setItem(AUTOTRADER_SETTINGS_KEY, JSON.stringify({
+        predDigit, direction, duration, stake, staking, martingaleMult, maxLosses, maxDrawdown, profitTarget,
+      }));
+    } catch { /* storage unavailable — settings just won't persist, not fatal */ }
+  }, [predDigit, direction, duration, stake, staking, martingaleMult, maxLosses, maxDrawdown, profitTarget]);
 
   // Config ref stays current every render so the async settlement callback
   // (which fires later, after a real network round-trip) always reads the
@@ -1138,20 +1169,30 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
       const cfg = configRef.current;
       const needsBarrier = cfg.direction !== 'odd' && cfg.direction !== 'even';
       const stakeToUse = cfg.staking === 'martingale' ? currentStake : Number(cfg.stake);
-      const proposal = await sendTradeRequest({
-        proposal: 1,
-        amount: stakeToUse,
-        basis: 'stake',
-        contract_type: contractTypeFor(cfg.direction),
-        currency: 'USD',
-        duration: Math.max(1, Number(cfg.duration) || 1),
-        duration_unit: 't',
-        underlying_symbol: cfg.symbol, // new Options API renames 'symbol' to 'underlying_symbol' for contract calls
-        ...(needsBarrier ? { barrier: String(cfg.predDigit) } : {}),
-      });
+      let proposal;
+      try {
+        proposal = await sendTradeRequest({
+          proposal: 1,
+          amount: stakeToUse,
+          basis: 'stake',
+          contract_type: contractTypeFor(cfg.direction),
+          currency: 'USD',
+          duration: Math.max(1, Number(cfg.duration) || 1),
+          duration_unit: 't',
+          underlying_symbol: cfg.symbol, // new Options API renames 'symbol' to 'underlying_symbol' for contract calls
+          ...(needsBarrier ? { barrier: String(cfg.predDigit) } : {}),
+        }, 35000);
+      } catch (e) {
+        throw new Error(`proposal step: ${e.message || 'unknown error'}`);
+      }
       if (!proposal.proposal) { setPlacing(false); return; }
 
-      const buy = await sendTradeRequest({ buy: proposal.proposal.id, price: proposal.proposal.ask_price });
+      let buy;
+      try {
+        buy = await sendTradeRequest({ buy: proposal.proposal.id, price: proposal.proposal.ask_price }, 35000);
+      } catch (e) {
+        throw new Error(`buy step: ${e.message || 'unknown error'}`);
+      }
       if (!buy.buy) { setPlacing(false); return; }
 
       setTradesPlaced(n => n + 1);
@@ -1211,8 +1252,15 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
         }
       });
     } catch (e) {
-      log(`Trade failed: ${e.message || e.error?.message || 'unknown error'}`, 'error');
-      setStopReason('Stopped: an error occurred');
+      const msg = e.message || e.error?.message || 'unknown error';
+      const isTimeout = msg.toLowerCase().includes('timeout');
+      if (isTimeout) {
+        log(`Trade timed out: ${msg} — the trade may or may not have gone through. Check Positions on Deriv before placing another.`, 'error');
+        setStopReason('Stopped: timed out — verify on Deriv before continuing');
+      } else {
+        log(`Trade failed: ${msg}`, 'error');
+        setStopReason('Stopped: an error occurred');
+      }
       setEnabled(false);
       setPlacing(false);
     }
@@ -1229,6 +1277,14 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
     setEnabled(false);
     setStopReason('Stopped: manual stop');
     log('Auto-loop stopped manually', 'info');
+  };
+
+  const handleSaveSettings = () => {
+    const ok = saveAutoTraderSettings({
+      direction, predDigit, duration, stake, staking, martingaleMult,
+      maxLosses, maxDrawdown, profitTarget,
+    });
+    log(ok ? 'Settings saved — will be here next time you visit this tab' : 'Could not save settings', ok ? 'ok' : 'error');
   };
 
   return (
@@ -1331,6 +1387,9 @@ function AutoTraderView({ symbol, authStatus, sendTradeRequest, subscribeToContr
               Stop
             </button>
           )}
+          <button onClick={handleSaveSettings} disabled={enabled} style={{ ...styles.secondaryBtn, opacity: enabled ? 0.5 : 1 }}>
+            Save settings
+          </button>
         </div>
 
         <div style={styles.panelNote}>
